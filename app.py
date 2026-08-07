@@ -8,10 +8,14 @@ All other columns are optional and are documented in the Import tab.
 from __future__ import annotations
 
 from datetime import date
+import logging
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("launchcast")
 
 st.set_page_config(page_title="LaunchCast", page_icon="⚾", layout="wide")
 
@@ -20,13 +24,20 @@ PALETTE = {
     "blue": "#2563eb", "cyan": "#06b6d4", "gold": "#f59e0b",
 }
 
+# ── Session-state defaults ───────────────────────────────────
+if "slate" not in st.session_state:
+    st.session_state.slate = None
+    st.session_state.source_label = "Demo slate · replace with your CSV"
+    st.session_state.slate_day = date.today()
+    st.session_state.live_key = None
+
 
 @st.cache_data(show_spinner=False)
 def demo_slate() -> pd.DataFrame:
     """A useful slate on first launch; it also makes the UI easy to evaluate."""
     rng = np.random.default_rng(42)
     players = [
-        ("Aaron Judge", "NYY", "BOS", "R", "L", "C. Criswill"),
+        ("Aaron Judge", "NYY", "BOS", "R", "L", "C. Criswell"),
         ("Shohei Ohtani", "LAD", "SF", "L", "R", "L. Webb"),
         ("Juan Soto", "NYM", "PHI", "L", "R", "A. Nola"),
         ("Yordan Alvarez", "HOU", "TEX", "L", "R", "N. Eovaldi"),
@@ -41,7 +52,7 @@ def demo_slate() -> pd.DataFrame:
         ("Manny Machado", "SD", "ARI", "R", "L", "E. Rodríguez"),
         ("Corbin Carroll", "ARI", "SD", "L", "R", "D. Cease"),
         ("Byron Buxton", "MIN", "CLE", "R", "L", "L. Allen"),
-        ("Jazz Chisholm Jr.", "NYY", "BOS", "L", "R", "C. Criswill"),
+        ("Jazz Chisholm Jr.", "NYY", "BOS", "L", "R", "C. Criswell"),
     ]
     frame = pd.DataFrame(players, columns=["player_name", "team", "opponent", "bats", "pitcher_hand", "opp_pitcher"])
     frame["game"] = frame["team"] + " @ " + frame["opponent"]
@@ -70,14 +81,24 @@ def percentile(series: pd.Series, higher_is_better: bool = True) -> pd.Series:
     return score if higher_is_better else 100 - score
 
 
+# ── Scoring constants (extracted from magic numbers) ──────
+BASE_HR_PCT = 7.0
+HR_SCORE_COEF = 0.17
+ENV_COEF = 20.0
+HR_PCT_MIN, HR_PCT_MAX = 4.0, 29.0
+
+
 def score_slate(frame: pd.DataFrame, weights: dict[str, float]) -> pd.DataFrame:
     """Score by available signals; absent columns do not silently count as zero."""
     out = frame.copy()
+    # Secondary scores are explanatory lenses. The user-selected weights below
+    # remain the source of truth for the board's rank order.
     try:
         from models import enrich_slate
         out = enrich_slate(out)
     except Exception as exc:
-        st.sidebar.caption(f"ℹ️ enrich_slate unavailable: {type(exc).__name__}")
+        logger.debug("models.enrich_slate unavailable: %s", exc)
+
     signals = {
         "barrel_pct": percentile(num(out, "barrel_pct")),
         "hard_hit": percentile(num(out, "hard_hit")),
@@ -95,23 +116,36 @@ def score_slate(frame: pd.DataFrame, weights: dict[str, float]) -> pd.DataFrame:
         valid = signals[key].notna()
         weighted += signals[key].fillna(0) * weight
         total += valid.astype(float) * weight
+
     out["hr_score"] = (weighted / total.replace(0, np.nan)).round(1)
     out["data_coverage"] = (total / sum(weights.values()) * 100).fillna(0).round().astype(int)
+
     env = num(out, "env_boost", 1.0)
-    out["hr_game_pct"] = (7 + out["hr_score"].fillna(0) * .17 + (env - 1) * 20).clip(4, 29).round(1)
+    out["hr_game_pct"] = (
+        BASE_HR_PCT + out["hr_score"].fillna(0) * HR_SCORE_COEF + (env - 1) * ENV_COEF
+    ).clip(HR_PCT_MIN, HR_PCT_MAX).round(1)
+
     try:
         from props import add_hr_probabilities
         out = add_hr_probabilities(out)
         out["hr_game_pct"] = out["model_hr_game_pct"].fillna(out["hr_game_pct"]).round(1)
     except Exception as exc:
-        st.sidebar.caption(f"ℹ️ props unavailable: {type(exc).__name__}")
+        logger.debug("props.add_hr_probabilities unavailable: %s", exc)
+
     try:
         from sleepers import find_sleepers
         out = find_sleepers(out)
     except Exception as exc:
-        st.sidebar.caption(f"ℹ️ sleepers unavailable: {type(exc).__name__}")
-    out["grade"] = pd.cut(out["hr_score"], [-1, 25, 40, 55, 70, 84, 101], labels=["F", "C", "B", "B+", "A", "A+"]).astype("string").fillna("—")
-    out["signal"] = pd.cut(out["hr_score"], [-1, 40, 60, 75, 101], labels=["🔴", "🟠", "🟡", "🟢"]).astype("string").fillna("⚪")
+        logger.debug("sleepers.find_sleepers unavailable: %s", exc)
+
+    out["grade"] = pd.cut(
+        out["hr_score"], [-1, 25, 40, 55, 70, 84, 101],
+        labels=["F", "C", "B", "B+", "A", "A+"]
+    ).astype(str).fillna("—")
+    out["signal"] = pd.cut(
+        out["hr_score"], [-1, 40, 60, 75, 101],
+        labels=["🔴", "🟠", "🟡", "🟢"]
+    ).astype(str).fillna("⚪")
     out["smash_spot"] = np.select(
         [(out.hr_score >= 85) & (env >= 1.0), (out.hr_score >= 72) & (env >= .94), out.hr_score >= 63],
         ["🔥🔥🔥 ELITE", "🔥🔥 STRONG", "🔥 SMASH"], default=""
@@ -152,25 +186,13 @@ def inject_style() -> None:
     </style>""", unsafe_allow_html=True)
 
 
-def _safe_val(player, col, default=np.nan, fmt_str="{:.1f}", na_str="—"):
-    val = player.get(col, default)
-    if pd.isna(val):
-        return na_str
-    return fmt_str.format(val)
-
-
 inject_style()
 
-# ── Session state: always start with demo so the app renders instantly ──
-if "slate" not in st.session_state:
-    st.session_state.slate = demo_slate()
-    st.session_state.source_label = "Demo slate · replace with your CSV"
-    st.session_state.live_key = None
-
+# ── Sidebar ──────────────────────────────────────────────────
 with st.sidebar:
     st.title("⚾ LaunchCast")
     st.caption("A clearer way to scan tonight’s power spots.")
-    slate_day = st.date_input("Slate date", value=date.today())
+    slate_day = st.date_input("Slate date", value=st.session_state.slate_day)
     source_mode = st.radio("Data source", ["Demo slate", "Live MLB", "CSV upload"], horizontal=True)
     upload = st.file_uploader("Import slate CSV", type="csv", help="Use your own projections or Statcast exports.")
     st.divider()
@@ -185,97 +207,280 @@ presets = {
     "Recent form": {"barrel_pct": 1, "hard_hit": .8, "iso": 1, "avg_ev": .7, "fb_pct": .5, "pitcher_hr9": .8, "env_boost": .6, "recent_hr": 2},
 }
 
-# ── Data loading (lazy / button-driven) ──
-if source_mode == "CSV upload" and upload is not None:
-    raw_df, err = normalize_upload(upload)
-    if err:
-        st.error(f"CSV Error: {err}")
+# ── Data loading (lazy, never blocks first paint) ────────────
+if source_mode == "CSV upload":
+    if upload is None:
+        slate, source_label = demo_slate(), "Demo slate · upload a CSV to replace it"
+        st.sidebar.info("Choose a CSV above to load your slate.")
     else:
-        st.session_state.slate = raw_df
-        st.session_state.source_label = f"Uploaded CSV ({len(raw_df)} rows)"
-        st.session_state.live_key = None
+        slate, error = normalize_upload(upload)
+        if error:
+            st.sidebar.error(error)
+            slate, source_label = demo_slate(), "Demo slate (upload could not be used)"
+        else:
+            source_label = f"Imported slate · {len(slate)} hitters"
 
 elif source_mode == "Live MLB":
-    try:
-        from data_fetcher import build_live_slate
-        key = slate_day.isoformat()
-        if st.session_state.live_key != key:
-            with st.spinner("Fetching live MLB data..."):
-                live_df, msg = build_live_slate(key)
-                if not live_df.empty:
-                    st.session_state.slate = live_df
-                    st.session_state.source_label = msg
-                    st.session_state.live_key = key
+    live_key = f"live_{slate_day.isoformat()}"
+    # If we already have live data cached for this date, use it
+    if st.session_state.get("live_key") == live_key and st.session_state.slate is not None:
+        slate = st.session_state.slate
+        source_label = st.session_state.source_label
+    else:
+        # Always show demo first so the page never hangs
+        slate, source_label = demo_slate(), "Demo slate · click Load to fetch live data"
+        st.session_state.slate = slate
+        st.session_state.source_label = source_label
+
+        if st.sidebar.button("🔄 Load live slate", type="primary", use_container_width=True):
+            try:
+                from data_fetcher import build_live_slate
+                with st.spinner("Loading MLB schedule, lineups, and season Statcast data…"):
+                    slate, live_status = build_live_slate(slate_day.isoformat())
+                if slate.empty:
+                    st.sidebar.warning(live_status)
+                    slate, source_label = demo_slate(), "Demo slate (no live player rows available)"
                 else:
-                    st.warning(msg)
-    except Exception as e:
-        st.error(f"Live data fetch failed: {type(e).__name__} - {e}")
+                    source_label = live_status
+                st.session_state.slate = slate
+                st.session_state.source_label = source_label
+                st.session_state.live_key = live_key
+                st.rerun()
+            except Exception as exc:
+                st.sidebar.error(f"Live data failed: {exc}")
+                slate, source_label = demo_slate(), f"Demo slate (live error: {type(exc).__name__})"
+                st.session_state.slate = slate
+                st.session_state.source_label = source_label
 
-elif source_mode == "Demo slate":
-    if st.session_state.source_label != "Demo slate":
-        st.session_state.slate = demo_slate()
-        st.session_state.source_label = "Demo slate"
-        st.session_state.live_key = None
+else:  # Demo slate
+    slate, source_label = demo_slate(), "Demo slate · replace with your CSV"
 
-if st.sidebar.button("Reset to Demo Slate"):
-    st.session_state.slate = demo_slate()
-    st.session_state.source_label = "Demo slate"
-    st.session_state.live_key = None
+# Ensure we have a slate no matter what
+if slate is None:
+    slate = demo_slate()
+    source_label = "Demo slate (fallback)"
 
-# ── Score and Display ──
-weights = presets[model]
-scored = score_slate(st.session_state.slate, weights)
+scored = score_slate(slate, presets[model])
 
-st.markdown(f"""
-<div class="hero">
-    <p class="eyebrow">{st.session_state.source_label}</p>
-    <h1>⚾ LaunchCast</h1>
-    <p>Scanning tonight’s power spots with a <strong>{model}</strong> profile.</p>
-</div>
-""", unsafe_allow_html=True)
+# ── Hero + Metrics ───────────────────────────────────────────
+st.markdown(
+    f"<div class='hero'><div class='eyebrow'>{slate_day:%A, %B %-d} · {source_label}</div>"
+    f"<h1>Find the cleanest power spots.</h1>"
+    f"<p>Transparent, slate-relative rankings built from the signals you choose.</p></div>",
+    unsafe_allow_html=True
+)
 
-if scored.empty:
-    st.warning("No players available to score. Please upload a valid CSV or wait for Live MLB lineups.")
-else:
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Players Scanned", len(scored))
-    c2.metric("Avg HR Score", f"{scored['hr_score'].mean():.1f}")
-    smash_spots = scored['smash_spot'].astype(str).str.strip().ne("").sum()
-    c3.metric("Top Smash Spots", smash_spots)
+top = scored.iloc[0] if not scored.empty else None
+metrics = st.columns(4)
+metrics[0].metric("Hitters analyzed", len(scored))
+metrics[1].metric("Elite smash spots", int((scored.smash_spot == "🔥🔥🔥 ELITE").sum()))
+metrics[2].metric("Best environment", f"{num(scored, 'env_boost', 1).max():.2f}×")
+metrics[3].metric(
+    "Top HR game chance",
+    f"{top.hr_game_pct:.1f}%" if top is not None else "—",
+    top.player_name if top is not None else None
+)
 
-    st.subheader("Slate Rankings")
-    
-    display_cols = [
-        "player_name", "team", "opponent", "opp_pitcher", "hr_score", 
-        "grade", "hr_game_pct", "signal", "smash_spot", "data_coverage"
-    ]
-    display_cols = [c for c in display_cols if c in scored.columns]
+# ── Tabs ─────────────────────────────────────────────────────
+tab_overview, tab_player, tab_games, tab_sleepers, tab_learning, tab_model, tab_import = st.tabs(
+    ["Slate board", "Player lab", "Game center", "Sleeper radar", "Learning", "Custom model", "Import guide"]
+)
 
+with tab_overview:
+    st.subheader("Slate board")
+    left, right = st.columns([3, 1])
+    with left:
+        search = st.text_input("Filter players or teams", placeholder="e.g. Judge or NYY", label_visibility="collapsed")
+    with right:
+        starters_only = st.checkbox("Hide thin-data rows", value=True)
+    display = scored.copy()
+    if search:
+        mask = display[["player_name", "team", "opponent", "opp_pitcher"]].astype(str).apply(
+            lambda c: c.str.contains(search, case=False, na=False)
+        ).any(axis=1)
+        display = display[mask]
+    if starters_only:
+        display = display[display.data_coverage >= 50]
+    show = [c for c in [
+        "signal", "player_name", "team", "game", "opp_pitcher", "lineup_pos",
+        "hr_score", "hr_game_pct", "smash_spot", "power_score", "lift_score",
+        "matchup_score", "barrel_pct", "iso", "pitcher_hr9", "env_boost", "grade", "data_coverage"
+    ] if c in display]
+    labels = {
+        "signal": "Signal", "player_name": "Hitter", "opp_pitcher": "vs Pitcher",
+        "hr_score": "HR Score", "hr_game_pct": "HR Game%", "power_score": "Power",
+        "lift_score": "Lift", "matchup_score": "Matchup", "pitcher_hr9": "Pitcher HR/9",
+        "env_boost": "Env", "data_coverage": "Data %"
+    }
     st.dataframe(
-        scored[display_cols],
+        display[show].rename(columns=labels),
+        hide_index=True, use_container_width=True, height=500,
         column_config={
-            "player_name": "Player",
-            "team": "Team",
-            "opponent": "Opp",
-            "opp_pitcher": "Pitcher",
-            "hr_score": "HR Score",
-            "grade": "Grade",
-            "hr_game_pct": "HR Prob %",
-            "signal": "Signal",
-            "smash_spot": "Smash Spot",
-            "data_coverage": "Coverage %"
-        },
-        hide_index=True,
-        use_container_width=True
+            "HR Score": st.column_config.NumberColumn(format="%.1f"),
+            "HR Game%": st.column_config.NumberColumn(format="%.1f%%"),
+            "Env": st.column_config.NumberColumn(format="%.2fx")
+        }
+    )
+    st.caption("🔥 tiers are visual shortlists, not probability guarantees. A score only uses fields present in your import.")
+
+with tab_player:
+    st.subheader("Player lab")
+    chosen_name = st.selectbox("Choose a hitter", scored.player_name.tolist())
+    player_row = scored.loc[scored.player_name.eq(chosen_name)].iloc[0]
+    a, b, c, d = st.columns(4)
+    a.metric("HR Score", f"{player_row.hr_score:.1f}", player_row.grade)
+    b.metric("HR Game%", f"{player_row.hr_game_pct:.1f}%")
+    env_val = num(pd.DataFrame([player_row]), "env_boost", 1).iloc[0]
+    c.metric("Environment", f"{env_val:.2f}×")
+    d.metric("Data coverage", f"{player_row.data_coverage}%")
+    st.markdown(
+        f"**{player_row.player_name}** bats **{player_row.bats}** against "
+        f"**{player_row.opp_pitcher}** ({player_row.pitcher_hand}HP) in **{player_row.game}**. {player_row.smash_spot}"
+    )
+    # Build ingredients table efficiently (no repeated 1-row DataFrames)
+    p = player_row
+    ingredients = pd.DataFrame({
+        "Signal": [
+            "Power score", "Lift score", "Matchup score", "Discipline score",
+            "Barrel rate", "Hard-hit rate", "ISO", "Average exit velocity",
+            "Fly-ball rate", "Pitcher HR/9", "Environment", "Recent HR"
+        ],
+        "Value": [
+            f"{getattr(p, 'power_score', np.nan):.1f}" if hasattr(p, "power_score") else "—",
+            f"{getattr(p, 'lift_score', np.nan):.1f}" if hasattr(p, "lift_score") else "—",
+            f"{getattr(p, 'matchup_score', np.nan):.1f}" if hasattr(p, "matchup_score") else "—",
+            f"{getattr(p, 'discipline_score', np.nan):.1f}" if hasattr(p, "discipline_score") else "—",
+            f"{num(pd.DataFrame([p]), 'barrel_pct').iloc[0]:.1f}%",
+            f"{num(pd.DataFrame([p]), 'hard_hit').iloc[0]:.1f}%",
+            f"{num(pd.DataFrame([p]), 'iso').iloc[0]:.3f}",
+            f"{num(pd.DataFrame([p]), 'avg_ev').iloc[0]:.1f} mph",
+            f"{num(pd.DataFrame([p]), 'fb_pct').iloc[0]:.1f}%",
+            f"{num(pd.DataFrame([p]), 'pitcher_hr9').iloc[0]:.2f}",
+            f"{env_val:.2f}×",
+            str(int(num(pd.DataFrame([p]), 'recent_hr', 0).iloc[0]))
+        ]
+    })
+    st.dataframe(ingredients, hide_index=True, use_container_width=True)
+
+with tab_games:
+    st.subheader("Game center")
+    games = scored.groupby("game", dropna=False).agg(
+        Hitters=("player_name", "count"),
+        Avg_score=("hr_score", "mean"),
+        Best_score=("hr_score", "max"),
+        Best_environment=("env_boost", "max")
+    ).sort_values("Best_score", ascending=False).reset_index()
+    st.dataframe(
+        games, hide_index=True, use_container_width=True,
+        column_config={
+            "Avg_score": st.column_config.NumberColumn("Avg score", format="%.1f"),
+            "Best_score": st.column_config.NumberColumn("Best score", format="%.1f"),
+            "Best_environment": st.column_config.NumberColumn("Best env", format="%.2fx")
+        }
+    )
+    game = st.selectbox("Inspect game", games.game.tolist())
+    st.dataframe(
+        scored.loc[scored.game.eq(game), [c for c in ["player_name", "team", "bats", "opp_pitcher", "hr_score", "hr_game_pct", "smash_spot"] if c in scored]],
+        hide_index=True, use_container_width=True
+    )
+    if st.checkbox("Load available market totals", help="Uses ESPN's public scoreboard endpoint; odds are illustrative."):
+        try:
+            from game_context import get_vegas_totals
+            totals = get_vegas_totals(slate_day.isoformat())
+            if totals.empty or totals["total"].notna().sum() == 0:
+                st.info("No current market totals were available for this slate.")
+            else:
+                st.dataframe(
+                    totals, hide_index=True, use_container_width=True,
+                    column_config={
+                        "total": st.column_config.NumberColumn("Game total", format="%.1f"),
+                        "away_implied": st.column_config.NumberColumn("Away implied", format="%.2f"),
+                        "home_implied": st.column_config.NumberColumn("Home implied", format="%.2f")
+                    }
+                )
+        except Exception as exc:
+            st.info(f"Market context is unavailable right now ({type(exc).__name__}).")
+
+with tab_sleepers:
+    st.subheader("Sleeper radar")
+    st.caption("Sleeper score compares today's model strength to the player's season home-run total. It is a discovery aid, not an outcome prediction.")
+    sleeper_cols = [c for c in ["player_name", "team", "game", "hr_score", "hr_game_pct", "home_run", "sleeper_score", "env_boost", "weather_note"] if c in scored]
+    sleeper_series = scored.get("sleeper_score", pd.Series(index=scored.index, dtype=float))
+    radar = scored.loc[sleeper_series.notna(), sleeper_cols].sort_values("sleeper_score", ascending=False)
+    if radar.empty:
+        st.info("Sleeper identification needs season PA and home-run totals. Live data will populate it when available.")
+    else:
+        st.dataframe(radar, hide_index=True, use_container_width=True)
+
+with tab_learning:
+    st.subheader("Local learning loop")
+    st.caption("Save the current projection board, then later upload a small outcomes CSV (`player_id` or `player_name`, plus `hr`). Nothing is sent to a third-party storage service.")
+    try:
+        from backtest import grade_snapshot, list_snapshots, save_snapshot
+        from pattern_analysis import calibration_summary, feature_correlation
+        snapshots = list_snapshots()
+        if st.button("Save current slate snapshot"):
+            save_snapshot(slate_day.isoformat(), scored)
+            st.success("Snapshot saved locally.")
+            snapshots = list_snapshots()
+        st.metric("Saved snapshots", len(snapshots))
+        if snapshots:
+            labels = [f"{item['slate_date']} · {item['created_at'][:16].replace('T', ' ')}" for item in snapshots]
+            snapshot_index = st.selectbox("Snapshot to grade", range(len(snapshots)), format_func=lambda index: labels[index])
+            outcome_file = st.file_uploader("Outcomes CSV", type="csv", key="outcomes_csv")
+            if outcome_file:
+                try:
+                    graded = grade_snapshot(snapshot_index, pd.read_csv(outcome_file))
+                    summary = calibration_summary(graded)
+                    if not summary:
+                        st.warning("No projection rows matched that outcomes file.")
+                    else:
+                        a, b, c = st.columns(3)
+                        a.metric("Matched hitters", summary["n"])
+                        b.metric("Actual HR rate", f"{summary['actual_hr_rate']}%")
+                        c.metric("Brier score", summary["brier_score"])
+                        st.dataframe(feature_correlation(graded), hide_index=True, use_container_width=True)
+                except Exception as exc:
+                    st.warning(f"Could not grade this file: {exc}")
+        else:
+            st.info("No snapshots saved yet.")
+    except Exception as exc:
+        st.warning(f"Learning storage is unavailable: {type(exc).__name__}")
+
+with tab_model:
+    st.subheader("Build a transparent score")
+    st.caption("Adjusting a weight immediately re-ranks this slate. Missing values are excluded from that hitter's denominator, so sparse rows are not falsely penalized.")
+    custom = {}
+    columns = st.columns(4)
+    friendly = {
+        "barrel_pct": "Barrel rate", "hard_hit": "Hard-hit", "iso": "ISO",
+        "avg_ev": "Exit velocity", "fb_pct": "Fly-ball", "pitcher_hr9": "Pitcher HR/9",
+        "env_boost": "Environment", "recent_hr": "Recent HR"
+    }
+    for i, (key, label) in enumerate(friendly.items()):
+        with columns[i % 4]:
+            custom[key] = st.slider(label, 0.0, 3.0, float(presets[model][key]), .1, key=f"weight_{key}")
+    custom_scored = score_slate(slate, custom)
+    st.dataframe(
+        custom_scored[[c for c in ["player_name", "team", "hr_score", "hr_game_pct", "data_coverage", "smash_spot"] if c in custom_scored]].head(20),
+        hide_index=True, use_container_width=True
     )
 
-tab1, tab2 = st.tabs(["Import Guide", "About"])
-with tab1:
-    st.markdown("""
-    ### CSV Import Guide
-    To analyze your own projections, upload a CSV with the following columns:
-    - **Required:** `player_name`, `team`
-    - **Optional (improves scoring):** `opponent`, `bats`, `pitcher_hand`, `opp_pitcher`, `barrel_pct`, `hard_hit`, `iso`, `avg_ev`, `fb_pct`, `pitcher_hr9`, `env_boost`, `recent_hr`
-    """)
-with tab2:
-    st.markdown("LaunchCast is an independent Streamlit rebuild of a power-hitting dashboard. Scores are relative to the loaded slate and do not constitute betting advice.")
+with tab_import:
+    st.subheader("Bring your own slate")
+    st.write("Upload a CSV in the sidebar. Only `player_name` and `team` are required; the app degrades gracefully when optional metrics are absent.")
+    guide = pd.DataFrame([
+        ("player_name, team", "Required", "Identity fields"),
+        ("opponent, opp_pitcher, bats, pitcher_hand, game", "Optional", "Matchup context"),
+        ("barrel_pct, hard_hit, iso, avg_ev, fb_pct", "Optional", "Hitter power inputs"),
+        ("pitcher_hr9, env_boost, recent_hr, lineup_pos", "Optional", "Opponent / game inputs"),
+    ], columns=["Columns", "Status", "Purpose"])
+    st.dataframe(guide, hide_index=True, use_container_width=True)
+    st.download_button(
+        "Download CSV template",
+        data="player_name,team,opponent,opp_pitcher,bats,pitcher_hand,barrel_pct,hard_hit,iso,avg_ev,fb_pct,pitcher_hr9,env_boost,recent_hr,lineup_pos\nExample Player,AAA,BBB,Example Pitcher,R,L,12.5,48.2,0.255,91.3,38.0,1.45,1.06,2,3\n",
+        file_name="launchcast_slate_template.csv", mime="text/csv"
+    )
+
+st.divider()
+st.caption("LaunchCast · Built for transparent slate comparison. Verify lineups, weather, and market information independently.")
