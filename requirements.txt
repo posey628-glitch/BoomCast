@@ -1,0 +1,5 @@
+# Tested together on Python 3.11. Pinning avoids surprise provider upgrades.
+streamlit==1.44.0
+pandas==2.2.3
+numpy==1.26.4
+requests==2.32.3
