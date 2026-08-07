@@ -1,10 +1,7 @@
-"""LaunchCast — a lightweight MLB home-run slate dashboard.
+"""LaunchCast — Predictive MLB power-hitting research dashboard.
 
-Run with: streamlit run app.py
-Upload a CSV to replace the built-in demo slate. Required: player_name, team.
-All other columns are optional and are documented in the Import tab.
+Run: streamlit run app.py
 """
-
 from __future__ import annotations
 
 from datetime import date
@@ -12,6 +9,9 @@ import logging
 
 import numpy as np
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
 logging.basicConfig(level=logging.INFO)
@@ -22,9 +22,10 @@ st.set_page_config(page_title="LaunchCast", page_icon="⚾", layout="wide")
 PALETTE = {
     "ink": "#0b1220", "muted": "#64748b", "line": "#e2e8f0",
     "blue": "#2563eb", "cyan": "#06b6d4", "gold": "#f59e0b",
+    "red": "#ef4444", "green": "#22c55e", "orange": "#f97316",
 }
 
-# ── Session-state defaults ───────────────────────────────────
+# ── Session state ──────────────────────────────────────────────
 if "slate" not in st.session_state:
     st.session_state.slate = None
     st.session_state.source_label = "Demo slate · replace with your CSV"
@@ -34,7 +35,6 @@ if "slate" not in st.session_state:
 
 @st.cache_data(show_spinner=False)
 def demo_slate() -> pd.DataFrame:
-    """A useful slate on first launch; it also makes the UI easy to evaluate."""
     rng = np.random.default_rng(42)
     players = [
         ("Aaron Judge", "NYY", "BOS", "R", "L", "C. Criswell"),
@@ -66,6 +66,13 @@ def demo_slate() -> pd.DataFrame:
     frame["env_boost"] = np.round(rng.uniform(.86, 1.18, len(frame)), 2)
     frame["recent_hr"] = rng.integers(0, 5, len(frame))
     frame["start_time"] = [f"{6 + (i % 5)}:{'10' if i % 2 else '40'} PM ET" for i in range(len(frame))]
+    # Simulated rolling stats for research
+    frame["barrel_pct_l7"] = np.round(frame["barrel_pct"] + rng.uniform(-3, 3, len(frame)), 1)
+    frame["barrel_pct_l14"] = np.round(frame["barrel_pct"] + rng.uniform(-2, 2, len(frame)), 1)
+    frame["hard_hit_l7"] = np.round(frame["hard_hit"] + rng.uniform(-5, 5, len(frame)), 1)
+    frame["iso_l7"] = np.round(frame["iso"] + rng.uniform(-.05, .05, len(frame)), 3)
+    frame["avg_ev_l7"] = np.round(frame["avg_ev"] + rng.uniform(-1.5, 1.5, len(frame)), 1)
+    frame["fb_pct_l7"] = np.round(frame["fb_pct"] + rng.uniform(-4, 4, len(frame)), 1)
     return frame
 
 
@@ -81,7 +88,6 @@ def percentile(series: pd.Series, higher_is_better: bool = True) -> pd.Series:
     return score if higher_is_better else 100 - score
 
 
-# ── Scoring constants (extracted from magic numbers) ──────
 BASE_HR_PCT = 7.0
 HR_SCORE_COEF = 0.17
 ENV_COEF = 20.0
@@ -91,8 +97,6 @@ HR_PCT_MIN, HR_PCT_MAX = 4.0, 29.0
 def score_slate(frame: pd.DataFrame, weights: dict[str, float]) -> pd.DataFrame:
     """Score by available signals; absent columns do not silently count as zero."""
     out = frame.copy()
-    # Secondary scores are explanatory lenses. The user-selected weights below
-    # remain the source of truth for the board's rank order.
     try:
         from models import enrich_slate
         out = enrich_slate(out)
@@ -130,13 +134,13 @@ def score_slate(frame: pd.DataFrame, weights: dict[str, float]) -> pd.DataFrame:
         out = add_hr_probabilities(out)
         out["hr_game_pct"] = out["model_hr_game_pct"].fillna(out["hr_game_pct"]).round(1)
     except Exception as exc:
-        logger.debug("props.add_hr_probabilities unavailable: %s", exc)
+        logger.debug("props unavailable: %s", exc)
 
     try:
         from sleepers import find_sleepers
         out = find_sleepers(out)
     except Exception as exc:
-        logger.debug("sleepers.find_sleepers unavailable: %s", exc)
+        logger.debug("sleepers unavailable: %s", exc)
 
     out["grade"] = pd.cut(
         out["hr_score"], [-1, 25, 40, 55, 70, 84, 101],
@@ -163,7 +167,7 @@ def normalize_upload(upload) -> tuple[pd.DataFrame | None, str | None]:
     missing = assert_schema(raw)
     if missing:
         return None, "; ".join(missing)
-    for column, default in {"opponent": "—", "bats": "—", "pitcher_hand": "—", "opp_pitcher": "—", "game": ""}.items():
+    for column, default in {"opponent": "—", "bats": "—", "pitcher_hand": "R", "opp_pitcher": "—", "game": ""}.items():
         if column not in raw:
             raw[column] = default
     if raw.empty:
@@ -191,14 +195,14 @@ inject_style()
 # ── Sidebar ──────────────────────────────────────────────────
 with st.sidebar:
     st.title("⚾ LaunchCast")
-    st.caption("A clearer way to scan tonight’s power spots.")
+    st.caption("Predictive power-hitting research.")
     slate_day = st.date_input("Slate date", value=st.session_state.slate_day)
     source_mode = st.radio("Data source", ["Demo slate", "Live MLB", "CSV upload"], horizontal=True)
     upload = st.file_uploader("Import slate CSV", type="csv", help="Use your own projections or Statcast exports.")
     st.divider()
     st.subheader("Model emphasis")
     model = st.select_slider("Profile", options=["Balanced", "Power", "Matchup", "Recent form"], value="Balanced")
-    st.caption("Scores are relative to the loaded slate—not betting advice.")
+    st.caption("Scores are slate-relative—not betting advice.")
 
 presets = {
     "Balanced": {"barrel_pct": 1.5, "hard_hit": 1, "iso": 1.4, "avg_ev": 1, "fb_pct": .7, "pitcher_hr9": 1.2, "env_boost": .8, "recent_hr": .7},
@@ -207,7 +211,7 @@ presets = {
     "Recent form": {"barrel_pct": 1, "hard_hit": .8, "iso": 1, "avg_ev": .7, "fb_pct": .5, "pitcher_hr9": .8, "env_boost": .6, "recent_hr": 2},
 }
 
-# ── Data loading (lazy, never blocks first paint) ────────────
+# ── Data loading ─────────────────────────────────────────────
 if source_mode == "CSV upload":
     if upload is None:
         slate, source_label = demo_slate(), "Demo slate · upload a CSV to replace it"
@@ -222,16 +226,13 @@ if source_mode == "CSV upload":
 
 elif source_mode == "Live MLB":
     live_key = f"live_{slate_day.isoformat()}"
-    # If we already have live data cached for this date, use it
     if st.session_state.get("live_key") == live_key and st.session_state.slate is not None:
         slate = st.session_state.slate
         source_label = st.session_state.source_label
     else:
-        # Always show demo first so the page never hangs
         slate, source_label = demo_slate(), "Demo slate · click Load to fetch live data"
         st.session_state.slate = slate
         st.session_state.source_label = source_label
-
         if st.sidebar.button("🔄 Load live slate", type="primary", use_container_width=True):
             try:
                 from data_fetcher import build_live_slate
@@ -239,7 +240,7 @@ elif source_mode == "Live MLB":
                     slate, live_status = build_live_slate(slate_day.isoformat())
                 if slate.empty:
                     st.sidebar.warning(live_status)
-                    slate, source_label = demo_slate(), "Demo slate (no live player rows available)"
+                    slate, source_label = demo_slate(), "Demo slate (no live player rows)"
                 else:
                     source_label = live_status
                 st.session_state.slate = slate
@@ -251,11 +252,9 @@ elif source_mode == "Live MLB":
                 slate, source_label = demo_slate(), f"Demo slate (live error: {type(exc).__name__})"
                 st.session_state.slate = slate
                 st.session_state.source_label = source_label
-
-else:  # Demo slate
+else:
     slate, source_label = demo_slate(), "Demo slate · replace with your CSV"
 
-# Ensure we have a slate no matter what
 if slate is None:
     slate = demo_slate()
     source_label = "Demo slate (fallback)"
@@ -283,7 +282,7 @@ metrics[3].metric(
 
 # ── Tabs ─────────────────────────────────────────────────────
 tab_overview, tab_player, tab_games, tab_sleepers, tab_learning, tab_model, tab_import = st.tabs(
-    ["Slate board", "Player lab", "Game center", "Sleeper radar", "Learning", "Custom model", "Import guide"]
+    ["📊 Slate board", "🔬 Player lab", "⚾ Game center", "💤 Sleeper radar", "🧠 Learning", "⚙️ Custom model", "📥 Import guide"]
 )
 
 with tab_overview:
@@ -323,33 +322,71 @@ with tab_overview:
     )
     st.caption("🔥 tiers are visual shortlists, not probability guarantees. A score only uses fields present in your import.")
 
+    # Distribution chart
+    if not display.empty and "hr_score" in display.columns:
+        fig = px.histogram(display, x="hr_score", nbins=20, color="grade",
+                           color_discrete_sequence=[PALETTE["red"], PALETTE["orange"], PALETTE["gold"], PALETTE["green"], "#3b82f6", "#8b5cf6"],
+                           title="HR Score Distribution", template="simple_white")
+        fig.update_layout(height=350, showlegend=True)
+        st.plotly_chart(fig, use_container_width=True)
+
 with tab_player:
-    st.subheader("Player lab")
+    st.subheader("Player Research Lab")
     chosen_name = st.selectbox("Choose a hitter", scored.player_name.tolist())
     player_row = scored.loc[scored.player_name.eq(chosen_name)].iloc[0]
-    a, b, c, d = st.columns(4)
+
+    # Top stat cards
+    a, b, c, d, e = st.columns(5)
     a.metric("HR Score", f"{player_row.hr_score:.1f}", player_row.grade)
     b.metric("HR Game%", f"{player_row.hr_game_pct:.1f}%")
     env_val = num(pd.DataFrame([player_row]), "env_boost", 1).iloc[0]
     c.metric("Environment", f"{env_val:.2f}×")
     d.metric("Data coverage", f"{player_row.data_coverage}%")
+    pred = getattr(player_row, "predictive_score", np.nan)
+    e.metric("Predictive", f"{pred:.1f}" if not pd.isna(pred) else "—")
+
+    # Matchup context
+    p_hand = getattr(player_row, "pitcher_hand", "R")
     st.markdown(
-        f"**{player_row.player_name}** bats **{player_row.bats}** against "
-        f"**{player_row.opp_pitcher}** ({player_row.pitcher_hand}HP) in **{player_row.game}**. {player_row.smash_spot}"
+        f"**{player_row.player_name}** ({player_row.team}) bats **{player_row.bats}** vs "
+        f"**{player_row.opp_pitcher}** ({p_hand}HP) · **{player_row.game}** · {player_row.smash_spot}"
     )
-    # Build ingredients table efficiently (no repeated 1-row DataFrames)
+
+    # Predictive factors breakdown
+    st.divider()
+    st.markdown("#### Predictive Factor Breakdown")
+    factors = []
+    for factor, label, color in [
+        ("power_score", "Power", PALETTE["red"]),
+        ("lift_score", "Lift", PALETTE["orange"]),
+        ("matchup_score", "Matchup", PALETTE["gold"]),
+        ("discipline_score", "Discipline", PALETTE["blue"]),
+        ("form_score", "Form", PALETTE["green"]),
+    ]:
+        val = getattr(player_row, factor, np.nan)
+        if not pd.isna(val):
+            factors.append({"Factor": label, "Score": float(val), "Color": color})
+    if factors:
+        fig = go.Figure(go.Bar(
+            x=[f["Factor"] for f in factors],
+            y=[f["Score"] for f in factors],
+            marker_color=[f["Color"] for f in factors],
+            text=[f"{f['Score']:.1f}" for f in factors],
+            textposition="outside"
+        ))
+        fig.update_layout(template="simple_white", height=350, yaxis_title="Score", showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Raw ingredients table
+    st.markdown("#### Raw Metrics")
     p = player_row
     ingredients = pd.DataFrame({
-        "Signal": [
-            "Power score", "Lift score", "Matchup score", "Discipline score",
-            "Barrel rate", "Hard-hit rate", "ISO", "Average exit velocity",
-            "Fly-ball rate", "Pitcher HR/9", "Environment", "Recent HR"
+        "Metric": [
+            "Barrel rate", "Hard-hit rate", "ISO", "Avg exit velo",
+            "Fly-ball rate", "Pitcher HR/9", "Environment", "Recent HR",
+            "Lineup position", "Park factor", "Weather boost"
         ],
-        "Value": [
-            f"{getattr(p, 'power_score', np.nan):.1f}" if hasattr(p, "power_score") else "—",
-            f"{getattr(p, 'lift_score', np.nan):.1f}" if hasattr(p, "lift_score") else "—",
-            f"{getattr(p, 'matchup_score', np.nan):.1f}" if hasattr(p, "matchup_score") else "—",
-            f"{getattr(p, 'discipline_score', np.nan):.1f}" if hasattr(p, "discipline_score") else "—",
+        "Season": [
             f"{num(pd.DataFrame([p]), 'barrel_pct').iloc[0]:.1f}%",
             f"{num(pd.DataFrame([p]), 'hard_hit').iloc[0]:.1f}%",
             f"{num(pd.DataFrame([p]), 'iso').iloc[0]:.3f}",
@@ -357,10 +394,39 @@ with tab_player:
             f"{num(pd.DataFrame([p]), 'fb_pct').iloc[0]:.1f}%",
             f"{num(pd.DataFrame([p]), 'pitcher_hr9').iloc[0]:.2f}",
             f"{env_val:.2f}×",
-            str(int(num(pd.DataFrame([p]), 'recent_hr', 0).iloc[0]))
+            str(int(num(pd.DataFrame([p]), 'recent_hr', 0).iloc[0])),
+            str(int(num(pd.DataFrame([p]), 'lineup_pos', 0).iloc[0])),
+            f"{num(pd.DataFrame([p]), 'park_factor', 1).iloc[0]:.2f}×" if hasattr(p, "park_factor") else "—",
+            f"{num(pd.DataFrame([p]), 'weather_boost', 1).iloc[0]:.2f}×" if hasattr(p, "weather_boost") else "—",
+        ],
+        "L7 Trend": [
+            f"{num(pd.DataFrame([p]), 'barrel_pct_l7').iloc[0]:.1f}%" if hasattr(p, "barrel_pct_l7") else "—",
+            f"{num(pd.DataFrame([p]), 'hard_hit_l7').iloc[0]:.1f}%" if hasattr(p, "hard_hit_l7") else "—",
+            f"{num(pd.DataFrame([p]), 'iso_l7').iloc[0]:.3f}" if hasattr(p, "iso_l7") else "—",
+            f"{num(pd.DataFrame([p]), 'avg_ev_l7').iloc[0]:.1f} mph" if hasattr(p, "avg_ev_l7") else "—",
+            f"{num(pd.DataFrame([p]), 'fb_pct_l7').iloc[0]:.1f}%" if hasattr(p, "fb_pct_l7") else "—",
+            "—", "—", "—", "—", "—", "—"
         ]
     })
     st.dataframe(ingredients, hide_index=True, use_container_width=True)
+
+    # Trend sparkline (simulated for demo)
+    st.markdown("#### Rolling Trend (simulated)")
+    trend_vals = []
+    for col in ["barrel_pct_l14", "barrel_pct_l7", "barrel_pct"]:
+        v = num(pd.DataFrame([p]), col).iloc[0]
+        if not pd.isna(v):
+            trend_vals.append(v)
+    if len(trend_vals) >= 2:
+        fig = go.Figure(go.Scatter(
+            x=["L14", "L7", "Season"][:len(trend_vals)],
+            y=trend_vals,
+            mode="lines+markers",
+            line=dict(color=PALETTE["blue"], width=3),
+            marker=dict(size=10)
+        ))
+        fig.update_layout(template="simple_white", height=300, yaxis_title="Barrel %", showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
 
 with tab_games:
     st.subheader("Game center")
@@ -413,39 +479,90 @@ with tab_sleepers:
         st.dataframe(radar, hide_index=True, use_container_width=True)
 
 with tab_learning:
-    st.subheader("Local learning loop")
-    st.caption("Save the current projection board, then later upload a small outcomes CSV (`player_id` or `player_name`, plus `hr`). Nothing is sent to a third-party storage service.")
+    st.subheader("🧠 Learning Lab — Find What Actually Predicts HRs")
+    st.caption("Save projection boards, upload outcomes, and discover which metrics are the best predictors.")
+
     try:
         from backtest import grade_snapshot, list_snapshots, save_snapshot
-        from pattern_analysis import calibration_summary, feature_correlation
+        from pattern_analysis import calibration_summary, feature_correlation, tier_performance, feature_importance
+
         snapshots = list_snapshots()
-        if st.button("Save current slate snapshot"):
-            save_snapshot(slate_day.isoformat(), scored)
-            st.success("Snapshot saved locally.")
-            snapshots = list_snapshots()
-        st.metric("Saved snapshots", len(snapshots))
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            if st.button("💾 Save current slate snapshot", use_container_width=True):
+                save_snapshot(slate_day.isoformat(), scored)
+                st.success("Snapshot saved.")
+                snapshots = list_snapshots()
+            st.metric("Saved snapshots", len(snapshots))
+
         if snapshots:
             labels = [f"{item['slate_date']} · {item['created_at'][:16].replace('T', ' ')}" for item in snapshots]
-            snapshot_index = st.selectbox("Snapshot to grade", range(len(snapshots)), format_func=lambda index: labels[index])
-            outcome_file = st.file_uploader("Outcomes CSV", type="csv", key="outcomes_csv")
+            snapshot_index = st.selectbox("Snapshot to grade", range(len(snapshots)), format_func=lambda i: labels[i])
+            outcome_file = st.file_uploader("Upload outcomes CSV (player_name + hr)", type="csv", key="outcomes_csv")
+
             if outcome_file:
                 try:
                     graded = grade_snapshot(snapshot_index, pd.read_csv(outcome_file))
                     summary = calibration_summary(graded)
+
                     if not summary:
                         st.warning("No projection rows matched that outcomes file.")
                     else:
-                        a, b, c = st.columns(3)
-                        a.metric("Matched hitters", summary["n"])
-                        b.metric("Actual HR rate", f"{summary['actual_hr_rate']}%")
-                        c.metric("Brier score", summary["brier_score"])
-                        st.dataframe(feature_correlation(graded), hide_index=True, use_container_width=True)
+                        # Top metrics
+                        st.markdown("#### Calibration Summary")
+                        m1, m2, m3, m4 = st.columns(4)
+                        m1.metric("Matched hitters", summary["n"])
+                        m2.metric("Actual HR rate", f"{summary['actual_hr_rate']}%")
+                        m3.metric("Avg predicted", f"{summary['avg_predicted_prob']}%")
+                        m4.metric("Brier score", summary["brier_score"])
+
+                        st.markdown("---")
+
+                        # Feature correlation
+                        st.markdown("#### Feature Correlation with HR Outcomes")
+                        corr_df = feature_correlation(graded)
+                        if not corr_df.empty:
+                            fig = px.bar(corr_df, x="correlation", y="feature", orientation="h",
+                                         color="correlation", color_continuous_scale="RdYlGn",
+                                         range_color=[-0.5, 0.5], template="simple_white")
+                            fig.update_layout(height=400)
+                            st.plotly_chart(fig, use_container_width=True)
+                            st.dataframe(corr_df, hide_index=True, use_container_width=True)
+
+                        # Feature importance (effect size)
+                        st.markdown("#### Feature Importance (Effect Size)")
+                        imp_df = feature_importance(graded)
+                        if not imp_df.empty:
+                            fig = px.bar(imp_df.head(10), x="cohens_d", y="feature", orientation="h",
+                                         color="cohens_d", color_continuous_scale="Blues",
+                                         template="simple_white")
+                            fig.update_layout(height=350)
+                            st.plotly_chart(fig, use_container_width=True)
+                            st.dataframe(imp_df, hide_index=True, use_container_width=True)
+
+                        # Tier performance
+                        st.markdown("#### Performance by Grade Tier")
+                        tier_df = tier_performance(graded)
+                        if not tier_df.empty:
+                            fig = make_subplots(rows=1, cols=2, subplot_titles=("Actual vs Predicted HR%", "Calibration Gap"))
+                            fig.add_trace(go.Bar(name="Actual HR%", x=tier_df["grade"], y=tier_df["actual_hr_rate"], marker_color=PALETTE["green"]), row=1, col=1)
+                            fig.add_trace(go.Bar(name="Predicted HR%", x=tier_df["grade"], y=tier_df["avg_predicted"], marker_color=PALETTE["blue"]), row=1, col=1)
+                            fig.add_trace(go.Bar(name="Gap", x=tier_df["grade"], y=tier_df["calibration_gap"], marker_color=PALETTE["orange"]), row=1, col=2)
+                            fig.update_layout(template="simple_white", height=400, showlegend=False)
+                            st.plotly_chart(fig, use_container_width=True)
+                            st.dataframe(tier_df, hide_index=True, use_container_width=True)
+
+                        # Raw graded data
+                        with st.expander("View graded data"):
+                            st.dataframe(graded[[c for c in ["player_name", "team", "hr_score", "hr_game_pct", "grade", "homered", "brier"] if c in graded]], hide_index=True)
+
                 except Exception as exc:
-                    st.warning(f"Could not grade this file: {exc}")
+                    st.error(f"Could not grade this file: {exc}")
         else:
-            st.info("No snapshots saved yet.")
+            st.info("No snapshots saved yet. Save one above, then upload an outcomes CSV to grade it.")
+
     except Exception as exc:
-        st.warning(f"Learning storage is unavailable: {type(exc).__name__}")
+        st.warning(f"Learning storage is unavailable: {type(exc).__name__}: {exc}")
 
 with tab_model:
     st.subheader("Build a transparent score")
@@ -466,6 +583,19 @@ with tab_model:
         hide_index=True, use_container_width=True
     )
 
+    # Weight sensitivity chart
+    st.markdown("#### Score Sensitivity")
+    sens = []
+    for key, label in friendly.items():
+        test = custom.copy()
+        test[key] = 0.0
+        test_scored = score_slate(slate, test)
+        sens.append({"Feature": label, "Avg Score": test_scored["hr_score"].mean(), "Max Score": test_scored["hr_score"].max()})
+    sens_df = pd.DataFrame(sens)
+    fig = px.bar(sens_df, x="Feature", y=["Avg Score", "Max Score"], barmode="group", template="simple_white")
+    fig.update_layout(height=350)
+    st.plotly_chart(fig, use_container_width=True)
+
 with tab_import:
     st.subheader("Bring your own slate")
     st.write("Upload a CSV in the sidebar. Only `player_name` and `team` are required; the app degrades gracefully when optional metrics are absent.")
@@ -474,11 +604,12 @@ with tab_import:
         ("opponent, opp_pitcher, bats, pitcher_hand, game", "Optional", "Matchup context"),
         ("barrel_pct, hard_hit, iso, avg_ev, fb_pct", "Optional", "Hitter power inputs"),
         ("pitcher_hr9, env_boost, recent_hr, lineup_pos", "Optional", "Opponent / game inputs"),
+        ("barrel_pct_l7, hard_hit_l7, iso_l7, avg_ev_l7, fb_pct_l7", "Optional", "Rolling trend inputs"),
     ], columns=["Columns", "Status", "Purpose"])
     st.dataframe(guide, hide_index=True, use_container_width=True)
     st.download_button(
         "Download CSV template",
-        data="player_name,team,opponent,opp_pitcher,bats,pitcher_hand,barrel_pct,hard_hit,iso,avg_ev,fb_pct,pitcher_hr9,env_boost,recent_hr,lineup_pos\nExample Player,AAA,BBB,Example Pitcher,R,L,12.5,48.2,0.255,91.3,38.0,1.45,1.06,2,3\n",
+        data="player_name,team,opponent,opp_pitcher,bats,pitcher_hand,barrel_pct,hard_hit,iso,avg_ev,fb_pct,pitcher_hr9,env_boost,recent_hr,lineup_pos,barrel_pct_l7,hard_hit_l7,iso_l7,avg_ev_l7,fb_pct_l7\nExample Player,AAA,BBB,Example Pitcher,R,L,12.5,48.2,0.255,91.3,38.0,1.45,1.06,2,3,14.2,52.1,0.310,93.5,42.0\n",
         file_name="launchcast_slate_template.csv", mime="text/csv"
     )
 
