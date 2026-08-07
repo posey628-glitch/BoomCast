@@ -13,7 +13,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-
 st.set_page_config(page_title="LaunchCast", page_icon="⚾", layout="wide")
 
 PALETTE = {
@@ -27,7 +26,7 @@ def demo_slate() -> pd.DataFrame:
     """A useful slate on first launch; it also makes the UI easy to evaluate."""
     rng = np.random.default_rng(42)
     players = [
-        ("Aaron Judge", "NYY", "BOS", "R", "L", "C. Criswell"),
+        ("Aaron Judge", "NYY", "BOS", "R", "L", "C. Criswill"),
         ("Shohei Ohtani", "LAD", "SF", "L", "R", "L. Webb"),
         ("Juan Soto", "NYM", "PHI", "L", "R", "A. Nola"),
         ("Yordan Alvarez", "HOU", "TEX", "L", "R", "N. Eovaldi"),
@@ -42,7 +41,7 @@ def demo_slate() -> pd.DataFrame:
         ("Manny Machado", "SD", "ARI", "R", "L", "E. Rodríguez"),
         ("Corbin Carroll", "ARI", "SD", "L", "R", "D. Cease"),
         ("Byron Buxton", "MIN", "CLE", "R", "L", "L. Allen"),
-        ("Jazz Chisholm Jr.", "NYY", "BOS", "L", "R", "C. Criswell"),
+        ("Jazz Chisholm Jr.", "NYY", "BOS", "L", "R", "C. Criswill"),
     ]
     frame = pd.DataFrame(players, columns=["player_name", "team", "opponent", "bats", "pitcher_hand", "opp_pitcher"])
     frame["game"] = frame["team"] + " @ " + frame["opponent"]
@@ -186,4 +185,97 @@ presets = {
     "Recent form": {"barrel_pct": 1, "hard_hit": .8, "iso": 1, "avg_ev": .7, "fb_pct": .5, "pitcher_hr9": .8, "env_boost": .6, "recent_hr": 2},
 }
 
-# ── Data loading (lazy / button-driven
+# ── Data loading (lazy / button-driven) ──
+if source_mode == "CSV upload" and upload is not None:
+    raw_df, err = normalize_upload(upload)
+    if err:
+        st.error(f"CSV Error: {err}")
+    else:
+        st.session_state.slate = raw_df
+        st.session_state.source_label = f"Uploaded CSV ({len(raw_df)} rows)"
+        st.session_state.live_key = None
+
+elif source_mode == "Live MLB":
+    try:
+        from data_fetcher import build_live_slate
+        key = slate_day.isoformat()
+        if st.session_state.live_key != key:
+            with st.spinner("Fetching live MLB data..."):
+                live_df, msg = build_live_slate(key)
+                if not live_df.empty:
+                    st.session_state.slate = live_df
+                    st.session_state.source_label = msg
+                    st.session_state.live_key = key
+                else:
+                    st.warning(msg)
+    except Exception as e:
+        st.error(f"Live data fetch failed: {type(e).__name__} - {e}")
+
+elif source_mode == "Demo slate":
+    if st.session_state.source_label != "Demo slate":
+        st.session_state.slate = demo_slate()
+        st.session_state.source_label = "Demo slate"
+        st.session_state.live_key = None
+
+if st.sidebar.button("Reset to Demo Slate"):
+    st.session_state.slate = demo_slate()
+    st.session_state.source_label = "Demo slate"
+    st.session_state.live_key = None
+
+# ── Score and Display ──
+weights = presets[model]
+scored = score_slate(st.session_state.slate, weights)
+
+st.markdown(f"""
+<div class="hero">
+    <p class="eyebrow">{st.session_state.source_label}</p>
+    <h1>⚾ LaunchCast</h1>
+    <p>Scanning tonight’s power spots with a <strong>{model}</strong> profile.</p>
+</div>
+""", unsafe_allow_html=True)
+
+if scored.empty:
+    st.warning("No players available to score. Please upload a valid CSV or wait for Live MLB lineups.")
+else:
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Players Scanned", len(scored))
+    c2.metric("Avg HR Score", f"{scored['hr_score'].mean():.1f}")
+    smash_spots = scored['smash_spot'].astype(str).str.strip().ne("").sum()
+    c3.metric("Top Smash Spots", smash_spots)
+
+    st.subheader("Slate Rankings")
+    
+    display_cols = [
+        "player_name", "team", "opponent", "opp_pitcher", "hr_score", 
+        "grade", "hr_game_pct", "signal", "smash_spot", "data_coverage"
+    ]
+    display_cols = [c for c in display_cols if c in scored.columns]
+
+    st.dataframe(
+        scored[display_cols],
+        column_config={
+            "player_name": "Player",
+            "team": "Team",
+            "opponent": "Opp",
+            "opp_pitcher": "Pitcher",
+            "hr_score": "HR Score",
+            "grade": "Grade",
+            "hr_game_pct": "HR Prob %",
+            "signal": "Signal",
+            "smash_spot": "Smash Spot",
+            "data_coverage": "Coverage %"
+        },
+        hide_index=True,
+        use_container_width=True
+    )
+
+tab1, tab2 = st.tabs(["Import Guide", "About"])
+with tab1:
+    st.markdown("""
+    ### CSV Import Guide
+    To analyze your own projections, upload a CSV with the following columns:
+    - **Required:** `player_name`, `team`
+    - **Optional (improves scoring):** `opponent`, `bats`, `pitcher_hand`, `opp_pitcher`, `barrel_pct`, `hard_hit`, `iso`, `avg_ev`, `fb_pct`, `pitcher_hr9`, `env_boost`, `recent_hr`
+    """)
+with tab2:
+    st.markdown("LaunchCast is an independent Streamlit rebuild of a power-hitting dashboard. Scores are relative to the loaded slate and do not constitute betting advice.")
