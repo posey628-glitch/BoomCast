@@ -48,3 +48,29 @@ def test_smash_thresholds_locked():
     assert scoring.SMASH_ELITE_SCORE == 85
     assert scoring.SMASH_STRONG_SCORE == 75
     assert scoring.SMASH_BASE_SCORE == 65
+
+
+# ── Phase 3: helpers.py tests ────────────────────────────────────────────────
+import helpers
+
+def test_metric_signal_bands():
+    assert helpers.metric_signal("barrel_pct", 13) == ("🟢", "elite")
+    assert helpers.metric_signal("barrel_pct", 3) == ("🔴", "below avg")
+    assert helpers.metric_signal("barrel_pct", None) == ("", "")
+
+def test_health_is_broken_flags_identical():
+    # the anti-fake-split guard — "identical" L/R must read as broken
+    assert helpers._health_is_broken("identical") is True
+    assert helpers._health_is_broken("❌ error") is True
+    assert helpers._health_is_broken("✅ working") is False
+
+def test_verify_split_detects_fake():
+    import pandas as pd
+    # identical L/R columns = fake split → is_real False
+    df = pd.DataFrame({"vl":[1.0,2.0,3.0], "vr":[1.0,2.0,3.0]})
+    is_real, pct = helpers._verify_split(df, ["vl"], ["vr"])
+    assert is_real is False
+    # differing columns = real split → True
+    df2 = pd.DataFrame({"vl":[1.0,2.0,3.0], "vr":[4.0,5.0,6.0]})
+    is_real2, pct2 = helpers._verify_split(df2, ["vl"], ["vr"])
+    assert is_real2 is True
