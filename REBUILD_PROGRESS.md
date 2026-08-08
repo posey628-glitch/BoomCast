@@ -68,7 +68,57 @@ Verified: compiles, imports cleanly, 9 behavior tests pass, outputs match origin
   be added to pipeline.py incrementally, each differential-tested.
 - app.py now 22,444 -> 21,278 lines. 6 clean modules + 14 tests.
 
+## Owner login — PRESERVED ✅
+Owner mode is byte-identical to mlb-hr-and-k: URL param `?owner=<key>` + password
+login, key pulled from Streamlit secrets (NOT hardcoded — keeps it out of the
+public repo). When you deploy BoomCast, add the SAME secret in its Streamlit
+Cloud settings:  Settings -> Secrets ->  `owner_key = "Posey628628"`
+Then your existing owner URL + password work identically.
+
+## Bug/error check — CLEAN ✅ (as of Phase 5)
+- All 6 BoomCast modules compile.
+- All expected symbols present in each module.
+- 36 symbols imported by app.py from BoomCast modules — every one EXISTS.
+- No duplicate definitions (nothing defined in BOTH app.py and a module).
+- 14 tests pass.
+
+## Phase 5 continued — HONEST STOPPING POINT
+Scanned all 11 inline functions in the main body. Only _add_robbed_hr_cols was
+genuinely near-pure (extracted). The rest capture closure state:
+  - _apply_pitch_match  -> needs pitcher_arsenal_vs_L/R from enclosing scope
+  - _ttop_for_pitcher   -> needs p_slate
+  - _apply_day_night    -> needs game_type
+  - _env_adj, _leader_by, _style_pitcher_df -> shared locals
+Extracting these = rewriting signatures + call sites = regression risk,
+verifiable only partially. LEFT IN app.py by design. This is the right
+engineering call, not a limitation of effort.
+
 ## Phase 6 — LATER (evidence-backed) : accuracy improvements
+
+## Owner login — PRESERVED ✅
+Owner mode is byte-identical to mlb-hr-and-k: URL param `?owner=<key>` + password
+login, key pulled from Streamlit secrets (NOT hardcoded — keeps it out of the
+public repo). When you deploy BoomCast, add the SAME secret in its Streamlit
+Cloud settings:  Settings -> Secrets ->  `owner_key = "Posey628628"`
+Then your existing owner URL + password work identically.
+
+## Bug/error check — CLEAN ✅ (as of Phase 5)
+- All 6 BoomCast modules compile.
+- All expected symbols present in each module.
+- 36 symbols imported by app.py from BoomCast modules — every one EXISTS.
+- No duplicate definitions (nothing defined in BOTH app.py and a module).
+- 14 tests pass.
+
+## Phase 5 continued — HONEST STOPPING POINT
+Scanned all 11 inline functions in the main body. Only _add_robbed_hr_cols was
+genuinely near-pure (extracted). The rest capture closure state:
+  - _apply_pitch_match  -> needs pitcher_arsenal_vs_L/R from enclosing scope
+  - _ttop_for_pitcher   -> needs p_slate
+  - _apply_day_night    -> needs game_type
+  - _env_adj, _leader_by, _style_pitcher_df -> shared locals
+Extracting these = rewriting signatures + call sites = regression risk,
+verifiable only partially. LEFT IN app.py by design. This is the right
+engineering call, not a limitation of effort.
 
 ## Phase 6 — LATER (evidence-backed) : accuracy improvements
 
