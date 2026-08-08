@@ -1,5 +1,4 @@
 .git/
-.github/
 .streamlit/secrets.toml
 work/
 __pycache__/
