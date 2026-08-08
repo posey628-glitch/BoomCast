@@ -74,3 +74,22 @@ def test_verify_split_detects_fake():
     df2 = pd.DataFrame({"vl":[1.0,2.0,3.0], "vr":[4.0,5.0,6.0]})
     is_real2, pct2 = helpers._verify_split(df2, ["vl"], ["vr"])
     assert is_real2 is True
+
+
+# ── Phase 5: pipeline.py differential tests ──────────────────────────────────
+import pipeline
+
+def test_robbed_hr_cols_xhr_math():
+    import pandas as pd, numpy as np
+    df = pd.DataFrame({"barrel_pct":[12.0], "pa":[200], "home_run":[20]})
+    out = pipeline._add_robbed_hr_cols(df)
+    # xhr = 0.12 * 0.385 * 200 = 9.24
+    assert abs(out.iloc[0]["xhr_neutral"] - 9.24) < 0.01
+    assert abs(out.iloc[0]["hr_luck_gap"] - (9.24 - 20)) < 0.01
+
+def test_robbed_hr_cols_missing_cols_safe():
+    import pandas as pd
+    # missing required columns → returns df unchanged (no crash)
+    df = pd.DataFrame({"player_name":["A"]})
+    out = pipeline._add_robbed_hr_cols(df)
+    assert "xhr_neutral" not in out.columns
