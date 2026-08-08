@@ -21,7 +21,7 @@ import streamlit as st
 # On startup we compare this against the cached version and clear @st.cache_data
 # if they differ. This avoids the "user uploads new code but Streamlit serves
 # the old cached function output until 1-hour TTL expires" problem.
-APP_VERSION = "2026.06.10-v46.54-per-player-outcome-log"
+APP_VERSION = "LaunchCast-2.0-v1.00-modular-rebuild"
 
 # v43.8 (reviewer-validated): single source of truth for pick_score component
 # weights. Previously these were literal dicts in three places (the scoring
@@ -642,7 +642,7 @@ except Exception:
 # ============================================================================
 
 st.set_page_config(
-    page_title="LaunchCast",
+    page_title="LaunchCast 2.0",
     page_icon="⚾",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -1867,7 +1867,7 @@ def log_swallowed_error(where: str, exc: Exception, surface: bool = True) -> Non
 # ============================================================================
 
 with st.sidebar:
-    st.title("🚀 LaunchCast")
+    st.title("🚀 LaunchCast 2.0")
     # v44.39 (user: "logging in later pushes me to the next day, but I don't
     # want that until all games are done"). date.today() uses the server's
     # clock (UTC on Streamlit Cloud) and flips at midnight — so a late-night
