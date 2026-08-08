@@ -1,39 +1,1219 @@
-"""Probability conversions. These are estimates, never betting recommendations."""
+"""
+props.py
+=========
+Converts internal model outputs into actual betting-relevant numbers:
+
+  - HR probability per hitter (0.00 - 1.00) — directly comparable to "+450 HR" odds
+  - Strikeout total projection per pitcher (with std dev range)
+  - Implied odds → break-even threshold logic
+  - "Edge vs market" calculations
+
+Designed for prop betting on HR and K markets.
+
+CALIBRATION NOTE:
+  League-avg HR/PA in 2024-25 was ~3.0%. A "good" HR prop hitter sits at 5-7%.
+  Aaron Judge in a great matchup ~12-15%. The model targets this range.
+
+  League-avg K/9 is ~8.6. Strong starter K projection 6.5-9.5 over 5-6 IP.
+  Strider/Skubal types project 8.5-11 in a good matchup.
+"""
+
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
-LEAGUE_HR_PER_PA = .030
-BARREL_TO_XHR_PER_PA = .385
+
+# Base HR rate per PA, MLB-wide. Used as anchor for prob calibration.
+LEAGUE_HR_PER_PA = 0.030
+
+# v43.19 (reviewer-validated): single source of truth for barrel→xHR.
+# Used by props.hr_prob_per_pa AND app.xhr_neutral display columns.
+# Derivation:
+#   barrel_pct = % of batted balls that are barrels (Statcast definition)
+#   BBE_per_PA ≈ 0.70   (typical PAs that become batted balls, excluding K/BB)
+#   HR_per_barrel ≈ 0.55 (Statcast research: barrels become HRs ~55% of time)
+#   xHR/PA ≈ (barrel_pct/100) × 0.70 × 0.55 = (barrel_pct/100) × 0.385
+# League avg 8% barrel × 0.385 = 3.08% xHR/PA, matching observed ~3.0% HR/PA.
+#
+# IMPORTANT: this constant already INCLUDES the BBE/PA factor. So when
+# computing xHR for full season: xHR = (barrel_pct/100) × CONSTANT × PA.
+# Don't multiply by BBE separately — that's the double-counting the v43.18
+# changelog was confused about.
+BARREL_TO_XHR_PER_PA = 0.385
+LEAGUE_K_PER_9 = 8.6
 
 
-def hr_prob_per_pa(row: dict, park_factor: float = 1.0, pitcher_hr9: float | None = None) -> float | None:
-    """Shrunk HR-per-PA estimate from observed HR rate and barrel rate."""
-    pa = pd.to_numeric(pd.Series([row.get("pa")]), errors="coerce").iloc[0]
-    hr = pd.to_numeric(pd.Series([row.get("home_run")]), errors="coerce").iloc[0]
-    barrel = pd.to_numeric(pd.Series([row.get("barrel_pct")]), errors="coerce").iloc[0]
-    if pd.isna(pa) or pa < 25 or pd.isna(hr):
+def _first_non_null(*values):
+    """v43.62 (reviewer-validated): NaN-safe first-non-null picker.
+
+    Replaces vulnerable `or` chains like `row.get("xba") or row.get("xBA")`.
+    NaN is truthy in Python's bool context, so the `or` short-circuits
+    and the fallback never runs — exactly the kind of silent failure the
+    review keeps catching. This helper actually checks `pd.isna` and
+    `is None` so NaN values properly defer to the next candidate.
+
+    Usage:
+        xba = _first_non_null(row.get("xba"), row.get("xBA"))
+        pa = _first_non_null(row.get("pa"), row.get("PA"), 0)
+    """
+    for v in values:
+        if v is None:
+            continue
+        try:
+            if pd.isna(v):
+                continue
+        except (TypeError, ValueError):
+            # Non-numeric (string, bool) — pd.isna may raise; treat as present
+            return v
+        return v
+    return None
+
+
+def hr_prob_per_pa(
+    hitter_row: dict,
+    pitcher_row: dict,
+    park_factor: float = 1.0,
+    park_hand_factor: float = 1.0,
+    weather_mult: float = 1.0,
+    pitch_match_score: float | None = None,
+    ttop_mult: float = 1.0,
+    defense_factor: float = 1.0,
+    min_pa: int = 25,  # v43.10: lowered from 100 — give call-ups, returning players a projection
+    bullpen_hr9: float | None = None,  # v37+ bullpen leverage adjustment
+    # v43.24 (reviewer-validated DOUBLE-COUNT FIX): day_night_mult kwarg
+    # removed. There is an existing day/night block further down in this
+    # function (the "NEW: DAY/NIGHT adjustment" section near line ~210)
+    # that already adjusts h_base based on vs_{game_type}_hr_per_pa with
+    # principled per-hitter base-rate shrinkage. The v43.18 day_night_mult
+    # parameter added a SECOND adjustment in ctx_mult based on the same
+    # underlying split data — compounding to ±25% deviation when both
+    # fired in the same direction. Reverting to the props.py-internal
+    # path which is the more principled (shrinks toward player's own
+    # base rate, not a slate-ratio).
+) -> float | None:
+    """
+    Returns P(HR | single PA today) using ONLY real data.
+    Returns None if hitter has insufficient sample (< min_pa) or no real data.
+
+    v43.10: Lowered min_pa default from 100 to 25. Bayesian shrinkage with
+    50 PA prior already keeps small-sample projections sensible — a hitter
+    with 30 PA and 2 HRs gets a shrunk rate of ~4.4%, not the raw 6.7%.
+    Hiding them entirely (returning None) was worse than showing a shrunk
+    projection with a confidence indicator. The confidence_tier flag added
+    to hitter rows in app.py tells the user how much to trust each grade.
+    """
+    # v43.62 (reviewer-validated CRITICAL fix): dual-name fallback.
+    # Previously read `pa` and `home_run` exclusively. If build_matchup_table
+    # ever renames to "PA" / "HR" / "homeRuns" (the v43.29 hit-signal bug
+    # was this exact failure class: pitcher BAA stored under batting_avg
+    # was never found), the function returns None for every hitter and the
+    # ENTIRE HR model goes silent with no error. hit_prob_per_pa and
+    # total_bases_per_pa both defensively read `row.get("pa") or row.get("PA")`.
+    # Match that pattern here.
+    if not hitter_row:
         return None
-    observed = (hr / pa * pa / (pa + 50)) + (LEAGUE_HR_PER_PA * 50 / (pa + 50))
-    expected = barrel / 100 * BARREL_TO_XHR_PER_PA if pd.notna(barrel) else LEAGUE_HR_PER_PA
-    observed_weight = min(.80, .30 + max(pa - 100, 0) / 500 * .50)
-    rate = observed * observed_weight + expected * (1 - observed_weight)
-    pitcher_factor = 1.0 if pitcher_hr9 is None or pd.isna(pitcher_hr9) else min(1.20, max(.80, float(pitcher_hr9) / 1.20))
-    return float(min(.15, max(.003, rate * park_factor * pitcher_factor)))
+    pa = (hitter_row.get("pa")
+          if hitter_row.get("pa") is not None and not pd.isna(hitter_row.get("pa"))
+          else (hitter_row.get("PA") if hitter_row.get("PA") is not None
+                and not pd.isna(hitter_row.get("PA")) else None))
+    hr = (hitter_row.get("home_run")
+          if hitter_row.get("home_run") is not None and not pd.isna(hitter_row.get("home_run"))
+          else (hitter_row.get("HR") if hitter_row.get("HR") is not None
+                and not pd.isna(hitter_row.get("HR")) else
+                (hitter_row.get("homeRuns") if hitter_row.get("homeRuns") is not None
+                 and not pd.isna(hitter_row.get("homeRuns")) else None)))
+
+    # Hard requirement: real PA and HR data
+    if pa is None or pd.isna(pa) or hr is None or pd.isna(hr):
+        return None
+    if pa < min_pa:
+        return None
+
+    # Real hitter base rate - BLENDED with barrel-based expected HR/PA
+    # to reduce noise from small/lucky samples.
+    #
+    # xHR/PA derivation:
+    #   barrel_pct = % of batted balls that are barrels (Statcast definition)
+    #   BBE_rate ≈ 0.70 (typical PAs that become batted balls, not K/BB)
+    #   HR_per_barrel ≈ 0.55 (Statcast research: barrels become HRs ~55% of time)
+    #   xHR/PA ≈ barrel_pct × 0.70 × 0.55 = barrel_pct × 0.385
+    #
+    # League calibration (v43.62 — single source of truth, see LEAGUE_HR_PER_PA):
+    #   LEAGUE_HR_PER_PA = 0.030 (3.0%) — the only number actually used by code.
+    #   League ~8% barrel × 0.385 = 3.08% xHR/PA ≈ matches the 3.0% anchor.
+    #   (Earlier docs in this file mentioned 2.8% and 3.1% in passing; those
+    #    were rough descriptive numbers, not different anchors. v43.62
+    #    harmonized: the only authoritative value is LEAGUE_HR_PER_PA = 0.030.)
+    #
+    # v43.62 (reviewer doc fix #2.4): blend weights — actual values:
+    #   100 PA → 30% observed / 70% xHR
+    #   300 PA → 50% observed / 50% xHR  (NOT 60% as the old doc claimed)
+    #   600 PA → 80% observed / 20% xHR
+    # Old doc said "300 PA → 60% observed" which doesn't match the formula
+    # `0.30 + (pa - 100) / 500 * 0.50` → at pa=300 that's 0.50, not 0.60.
+
+    # NEW: sample-size shrinkage on raw observed HR/PA to combat early-season noise.
+    # A hitter with 5 HR in 30 PA has 16.7% observed rate — that's not predictive.
+    # Shrink toward league avg using prior weight of 50 PA.
+    # Below 50 PA: observed barely matters. Above 300 PA: observed is most trusted.
+    h_observed_raw = hr / pa
+    obs_shrink_w = pa / (pa + 50)  # 50 PA prior
+    h_observed = h_observed_raw * obs_shrink_w + LEAGUE_HR_PER_PA * (1 - obs_shrink_w)
+
+    barrel_pct = hitter_row.get("barrel_pct")
+    if barrel_pct is not None and not pd.isna(barrel_pct) and barrel_pct > 0:
+        # v43.19: read from BARREL_TO_XHR_PER_PA constant (single source of
+        # truth — same value used by app.xhr_neutral display columns)
+        h_xhr = float(barrel_pct) / 100 * BARREL_TO_XHR_PER_PA
+        # Weight observed by sample size (asymptote at 0.80)
+        observed_weight = min(0.80, 0.30 + (pa - 100) / 500 * 0.50)
+        observed_weight = max(0.30, observed_weight)
+        h_base = h_observed * observed_weight + h_xhr * (1 - observed_weight)
+    else:
+        # No barrel data - fall back to observed only
+        h_base = h_observed
+
+    # HITTER vs-HANDEDNESS SPLIT ADJUSTMENT (June 2026)
+    # The h_base above uses OVERALL season stats. But platoon effects are
+    # real and large — Adell case study has 8.8% overall barrel but 31.6%
+    # vs-LHP barrel. Without this adjustment, a strong reverse-platoon hitter
+    # facing his preferred arm gets projected at his weak overall rate.
+    #
+    # Strategy: if we have vs-LHP/vs-RHP HR rate from MLB Stats API,
+    # compute a multiplier = (split HR/PA) / (overall HR/PA), shrunken by
+    # split sample size, and apply to h_base.
+    # Switch hitters bat opposite of pitcher arm → look up that side.
+    p_throws_now = (pitcher_row.get("p_throws") or pitcher_row.get("throws") or "").upper() if pitcher_row else ""
+    # v43.81 cleanup: h_bats_now was computed but never used (reviewer-flagged).
+    # The hitter's bat side is unused in this multiplier calc because the split
+    # is keyed off the pitcher's throwing hand, not the hitter's bat side —
+    # switch-hitter splits already reflect them batting from the favorable side.
+    # Determine which split applies. A LHB always faces vs-RHP if pitcher is R,
+    # but the hitter's split is denoted by the pitcher's hand (vs-LHP, vs-RHP).
+    h_split_key = None
+    if p_throws_now == "L":
+        h_split_key = "lhp"
+    elif p_throws_now == "R":
+        h_split_key = "rhp"
+    # For switch hitters: they bat opposite the pitcher, so they will face
+    # the pitcher with the favorable platoon. The split lookup is the same:
+    # use the pitcher's hand to find the hitter's vs-LHP or vs-RHP rate.
+    # Switch hitter splits already reflect this — their vs-RHP stats are from
+    # them batting left vs RHP.
+
+    if h_split_key:
+        split_hr_rate = hitter_row.get(f"vs_{h_split_key}_hr_per_pa")
+        split_pa = hitter_row.get(f"vs_{h_split_key}_pa")
+        if (split_hr_rate is not None and not pd.isna(split_hr_rate)
+                and split_pa is not None and not pd.isna(split_pa)
+                and float(split_pa) >= 30):
+            try:
+                split_hr_pa = float(split_hr_rate) / 100.0  # pct → rate
+                # Compute multiplier vs the overall rate.
+                # Use h_observed_raw (not the league-shrunk h_observed) as
+                # the "overall" baseline since split stats are also observed.
+                # Guard against divide-by-zero on contact hitters with 0 HR.
+                overall_rate = h_observed_raw if h_observed_raw > 0.005 else 0.025
+                split_mult_raw = split_hr_pa / overall_rate
+                # Shrink the multiplier toward 1.0 based on split sample size.
+                # v42f BUGFIX: raised prior from 100 → 150 PA. With the old
+                # 100-PA prior, mid-sample splits (~150 PA) earned 60% trust
+                # — enough that a weak-contact hitter's lucky platoon split
+                # inflated his HR Game% out of proportion. Mauricio Dubón
+                # case (149 PA vs RHP, 5.9% barrel, .130 ISO) projected at
+                # 21.9% HR Game% because his split rate happened to be hot.
+                # 150-PA prior drops that trust to ~50% → Dubón projects ~19%,
+                # while genuine reverse-platoon hitters with 400+ PA splits
+                # (Adell-tier) barely change (73% trust). Targets the noisy
+                # mid-sample band specifically.
+                # Trust curves:
+                #   30 PA:  ~17% (heavy shrink)
+                #   100 PA: ~40% (moderate shrink)
+                #   150 PA: ~50% (was 60% under 100-prior)
+                #   400 PA: ~73% (was 80%)
+                split_pa_f = float(split_pa)
+                split_w = split_pa_f / (split_pa_f + 150)  # v42f: was +100
+                # Cap shrunk multiplier in [0.5, 2.0] to prevent extreme outliers
+                split_mult_shrunk = 1.0 + (split_mult_raw - 1.0) * split_w
+                split_mult_shrunk = max(0.5, min(2.0, split_mult_shrunk))
+                h_base = h_base * split_mult_shrunk
+                # v43.65 (reviewer fix P-B): mark that the hitter-split was
+                # applied so the platoon block downstream knows to dampen.
+                # Previously only `split_hr_per_pa` (pitcher-split) gated the
+                # dampener — but hitter-splits are 15× more common than
+                # pitcher-splits in production (404 vs 27 in the export
+                # the reviewer checked), so the typical case got full platoon
+                # multiplier ON TOP of the already-applied hitter-split.
+                # Now either flag triggers dampening.
+                _hitter_split_applied = True
+            except (TypeError, ValueError, ZeroDivisionError):
+                _hitter_split_applied = False
+        else:
+            _hitter_split_applied = False
+    else:
+        _hitter_split_applied = False
+
+    # NEW: RECENCY ADJUSTMENT - blend in recent-form hot/cold signal.
+    # recent_hr_weighted_rate gives last-3 games triple-weight, weighted across
+    # last 15 games. If this rate is significantly above/below season h_base,
+    # nudge h_base toward it (but bounded so we don't over-react to small samples).
+    #
+    # v43.62 (reviewer doc fix #2.3): cap math corrected. hot_cold_ratio
+    # is clamped to [0.75, 1.25] (±25% deviation) BUT then only 20% of
+    # the deviation is applied (`(ratio - 1.0) * 0.20`). So the real
+    # effective cap is **±5%** (25% × 0.20 = 5%), not ±25% as the
+    # previous comment claimed. The 0.75/1.25 numbers are the RATIO clamps,
+    # not the projection-impact bounds.
+    recent_weighted = hitter_row.get("recent_hr_weighted_rate")
+    if (recent_weighted is not None and not pd.isna(recent_weighted)
+            and recent_weighted > 0 and h_base > 0):
+        recent_rate_decimal = float(recent_weighted) / 100  # pct → rate
+        # Compute hot/cold ratio capped at [0.75, 1.25]
+        hot_cold_ratio = recent_rate_decimal / h_base
+        hot_cold_ratio = max(0.75, min(1.25, hot_cold_ratio))
+        # Apply only 20% of the deviation (effective cap: ±5%).
+        # Baseball research consistently shows hot/cold streaks have minimal
+        # predictive value beyond 1-2 weeks. Most quantitative analysts use
+        # 10-15% weight; 20% is a balanced choice that respects the signal
+        # without overreacting to small samples. Result: projections more
+        # stable, less reactive to short streaks.
+        adjustment = 1.0 + (hot_cold_ratio - 1.0) * 0.20
+        h_base = h_base * adjustment
+
+    # NEW: DAY/NIGHT adjustment - hitters perform differently in day vs night.
+    # Documented effect: most batters slightly worse in day games due to
+    # shadow / sun glare / visibility. Some hitters' splits are EXTREME.
+    # E.g. some batters hit 2x more HRs at night than day.
+    # game_type comes from app.py based on game start time.
+    game_type = hitter_row.get("game_type")  # "day" or "night"
+    if game_type in ("day", "night") and h_base > 0:
+        dn_pa_col = f"vs_{game_type}_pa"
+        dn_hr_col = f"vs_{game_type}_hr_per_pa"
+        dn_pa = hitter_row.get(dn_pa_col)
+        dn_hr = hitter_row.get(dn_hr_col)
+        # Need ≥40 PA in the split for reliability
+        if (dn_pa is not None and not pd.isna(dn_pa) and dn_pa >= 40
+                and dn_hr is not None and not pd.isna(dn_hr) and dn_hr > 0):
+            dn_rate_decimal = float(dn_hr) / 100
+            # Shrink toward h_base (don't fully trust split over base):
+            # shrink_w = pa / (pa + 100). 100 PA prior weight.
+            shrink_w = float(dn_pa) / (float(dn_pa) + 100)
+            dn_shrunk = dn_rate_decimal * shrink_w + h_base * (1 - shrink_w)
+            # Cap adjustment to ±15% of h_base (day/night is real but bounded)
+            dn_ratio = dn_shrunk / h_base
+            dn_ratio = max(0.85, min(1.15, dn_ratio))
+            # Apply 50% of the adjustment (conservative)
+            h_base = h_base * (1.0 + (dn_ratio - 1.0) * 0.50)
+
+    # Pitcher HR/9 adjustment - prefer handedness splits if available
+    p_hr9 = pitcher_row.get("hr9") if pitcher_row else None
+
+    # NEW: Try to use vs LHB / vs RHB HR/PA splits instead of overall HR/9
+    # If a RHP gives up 4.5% HR/PA to LHB but only 2.1% to RHB,
+    # an LHB facing him should see the 4.5 number, not the average.
+    h_bats = (hitter_row.get("bats") or "").upper()
+    # Fetch pitcher throws early so we can do switch-hitter handling
+    p_throws_early = (pitcher_row.get("p_throws") or pitcher_row.get("throws") or "").upper() if pitcher_row else ""
+    split_hr_per_pa = None
+    split_pa_count = 0
+    # v43.81 cleanup: split_source debugging local removed (reviewer-flagged).
+    # Determine which side of the pitcher's splits to use.
+    # - LHB → vs_lhb_ (pitcher's stats vs LHB)
+    # - RHB → vs_rhb_
+    # - Switch hitter: bats opposite of pitcher's throwing arm
+    #     vs RHP → switch bats L → use vs_lhb_ (pitcher's LHB-facing stats)
+    #     vs LHP → switch bats R → use vs_rhb_
+    effective_side = None
+    if h_bats == "L":
+        effective_side = "L"
+    elif h_bats == "R":
+        effective_side = "R"
+    elif h_bats == "S" and p_throws_early in ("L", "R"):
+        # Switch hitter chooses opposite side from the pitcher
+        effective_side = "L" if p_throws_early == "R" else "R"
+
+    if pitcher_row is not None and effective_side in ("L", "R"):
+        col_prefix = "vs_lhb_" if effective_side == "L" else "vs_rhb_"
+        split_hr = pitcher_row.get(f"{col_prefix}hr_per_pa")
+        split_pa = pitcher_row.get(f"{col_prefix}pa")
+
+        # PRIMARY: direct HR/PA split if available
+        if (split_hr is not None and not pd.isna(split_hr) and split_hr > 0
+                and split_pa is not None and not pd.isna(split_pa) and split_pa >= 40):
+            split_hr_per_pa = float(split_hr) / 100.0  # convert pct → rate
+            split_pa_count = float(split_pa)
+        else:
+            # FALLBACK: derive from SLG split (when MLB API doesn't return raw counts).
+            # SLG correlates strongly with HR/PA. Empirical mapping (2023-2024 data):
+            #   League avg SLG ~ .398, league avg HR/PA ~ 2.8%
+            #   .350 SLG → ~2.0% HR/PA
+            #   .450 SLG → ~3.6% HR/PA
+            #   .500 SLG → ~4.5% HR/PA
+            #   .550 SLG → ~5.5% HR/PA
+            #
+            # v43.62 (reviewer-validated CRITICAL fix): the previous formula
+            # `(slg_val - 0.250) * 12.5` undershot the documented table by
+            # 30-40% across the range:
+            #   .450 → 2.50% (table says 3.6%)
+            #   .500 → 3.13% (table says 4.5%)
+            #   .550 → 3.75% (table says 5.5%)
+            # Linear fit through (.350→2.0, .550→5.5) gives slope 17.5 and
+            # intercept 0.236, which matches the documented points within
+            # 0.15 percentage points across the whole range. Net effect of
+            # the old formula: any SLG-only pitcher looked more HR-suppressing
+            # than intended, depressing HR projections for the hitters
+            # facing him. Fallback path so limited blast radius, but a real
+            # miscalibration.
+            split_slg = pitcher_row.get(f"{col_prefix}slg")
+            # SLG splits don't tell us PA, so assume modest reliability (use 80 as PA)
+            if split_slg is not None and not pd.isna(split_slg) and split_slg > 0:
+                try:
+                    slg_val = float(split_slg)
+                    # Cap derivation to reasonable range (0.5% floor, 7% ceiling)
+                    derived_hr_pct = max(0.5, min(7.0, (slg_val - 0.236) * 17.5))
+                    split_hr_per_pa = derived_hr_pct / 100.0
+                    split_pa_count = 80  # treat as moderately reliable, shrinks somewhat
+                except (TypeError, ValueError):
+                    pass
+
+    if split_hr_per_pa is not None:
+        # Sample-size shrinkage on the SPLIT itself.
+        # League avg HR/PA ≈ 2.8%. A pitcher with 30 PA vs LHB has noisy splits;
+        # a pitcher with 200 PA vs LHB has reliable splits.
+        # Bayesian shrink: weight = pa / (pa + 80). 80 is the prior weight in PA.
+        # If pa=200: 200/280 = 71% real, 29% league avg
+        # If pa=40 :  40/120 = 33% real, 67% league avg
+        # Use the canonical LEAGUE_HR_PER_PA constant (3.0%) for both the
+        # shrinkage prior AND the denominator. Previously these were:
+        #   - shrinkage toward 0.028
+        #   - denominator 0.028 (splits) OR (1.30/9)/4.3 = 0.03362 (HR9)
+        # That dual-baseline inconsistency caused subtle pitcher_mult drift
+        # between the two paths for the same pitcher in edge cases.
+        shrink_w = split_pa_count / (split_pa_count + 80)
+        split_shrunk = split_hr_per_pa * shrink_w + LEAGUE_HR_PER_PA * (1 - shrink_w)
+        pitcher_mult = split_shrunk / LEAGUE_HR_PER_PA
+        pitcher_mult = max(0.5, min(2.0, pitcher_mult))
+    elif p_hr9 is None or pd.isna(p_hr9) or p_hr9 == 0:
+        pitcher_mult = 1.0  # No adjustment if we don't know
+    else:
+        # IP GATE — Lyon Richardson case (June 2026).
+        # Without this, a pitcher with 0.2 IP and 1 HR allowed has HR/9=13.50
+        # which clips to the 2.0× cap on EVERY hitter facing him. KC lineup
+        # was inflated to 20-24% HR Game% because of this single bad sample.
+        # Below 10 IP: treat as neutral (1.0×) — sample too noisy.
+        # 10-30 IP: shrink toward 1.0 (partial credit, scales with IP).
+        # 30+ IP: use raw HR/9 as before (real signal).
+        # Same principle as the era_savant clip(upper=12.0) and the splits-path
+        # Bayesian shrinkage — every other pitcher-rate path already guards
+        # against tiny samples; HR/9 was the one hole.
+        pitcher_ip_val = pitcher_row.get("ip") if pitcher_row else None
+        try:
+            pitcher_ip_f = (float(pitcher_ip_val)
+                            if pitcher_ip_val is not None and not pd.isna(pitcher_ip_val)
+                            else None)
+        except (TypeError, ValueError):
+            pitcher_ip_f = None
+
+        if pitcher_ip_f is not None and pitcher_ip_f < 10.0:
+            # Below 10 IP — treat as neutral. Sample too noisy.
+            pitcher_mult = 1.0
+        else:
+            p_hr_per_pa = (p_hr9 / 9) / 4.3  # ~4.3 PA per inning
+
+            # BULLPEN LEVERAGE BLEND (v37+)
+            # In a typical game, ~70% of opposing PAs come against the
+            # starter and ~30% come against relievers (after the starter
+            # exits in inning 5-6). If the team's bullpen has a notably
+            # high or low HR/9, the hitter's TRUE HR exposure is the
+            # weighted average, not just the starter's number.
+            #
+            # League-avg bullpen HR/9 ≈ 1.15. We blend at 70/30 by IP share:
+            #   blended_hr_per_pa = 0.7 * starter_hr_per_pa + 0.3 * bullpen_hr_per_pa
+            #
+            # Effect: matters most when bullpen and starter are very different.
+            # Examples:
+            #   - Good starter (HR/9 0.8) + bad bullpen (HR/9 1.6) →
+            #     starter alone says HR rate 2.1%, blended says 2.6% (+25%)
+            #   - Bad starter (HR/9 2.0) + good bullpen (HR/9 0.9) →
+            #     starter alone says 5.2%, blended says 4.4% (-15%)
+            if bullpen_hr9 is not None and not pd.isna(bullpen_hr9) and bullpen_hr9 > 0:
+                bp_hr_per_pa = (float(bullpen_hr9) / 9) / 4.3
+                p_hr_per_pa = 0.7 * p_hr_per_pa + 0.3 * bp_hr_per_pa
+
+            raw_mult = p_hr_per_pa / LEAGUE_HR_PER_PA
+            # Bayesian shrinkage toward 1.0 for IP in [10, 30].
+            # At IP=10: 50% real, 50% league avg (1.0)
+            # At IP=30: ~75% real, 25% league avg
+            # At IP=60: ~86% real, 14% league avg
+            # At IP=100: ~91% real (close to raw)
+            if pitcher_ip_f is not None:
+                ip_shrink_w = pitcher_ip_f / (pitcher_ip_f + 10.0)
+                shrunk_mult = raw_mult * ip_shrink_w + 1.0 * (1 - ip_shrink_w)
+            else:
+                # No IP data — use raw with caps
+                shrunk_mult = raw_mult
+            pitcher_mult = max(0.5, min(2.0, shrunk_mult))
+
+    # v43.21 (real accuracy gain — was deferred): pitcher RECENT form
+    # adjustment. We've been fetching recent_hr9 (HR/9 over L5 starts)
+    # since v37 but only using it for a display flag and a small fixed
+    # bonus (+1.5/+3). Recent form is one of the strongest signals for
+    # HR allowance — a pitcher whose recent_hr9 is 2.5 but season is 1.0
+    # is going through a stretch where his current stuff isn't working,
+    # and that's predictive for tonight. Conversely a usually-bad pitcher
+    # on a recent hot streak should get some credit.
+    #
+    # Conservative design:
+    #   - Only adjust when recent diverges MEANINGFULLY (ratio ≥1.5 worse
+    #     or ≤0.67 better) AND we have ≥3 recent starts (not 1 bad spot
+    #     start dragging everything)
+    #   - Cap the adjustment at ±10% on pitcher_mult — recent form is a
+    #     real signal but full season is still the stronger anchor for
+    #     most pitchers
+    #   - Re-clamp pitcher_mult to [0.5, 2.0] afterward
+    recent_hr9_val = (
+        pitcher_row.get("recent_hr9") if pitcher_row else None
+    )
+    recent_starts_val = (
+        pitcher_row.get("recent_starts") if pitcher_row else None
+    )
+    if (p_hr9 is not None and not pd.isna(p_hr9) and p_hr9 > 0
+            and recent_hr9_val is not None and not pd.isna(recent_hr9_val)
+            and float(recent_hr9_val) >= 0
+            and recent_starts_val is not None and not pd.isna(recent_starts_val)
+            and float(recent_starts_val) >= 3):
+        try:
+            ratio = float(recent_hr9_val) / float(p_hr9)
+            if ratio >= 1.5:
+                # Trending worse — bump pitcher_mult up (more HR exposure)
+                recent_form_adj = min(1.10, 1.0 + (ratio - 1.0) * 0.10)
+            elif ratio <= 0.67:
+                # Trending better — pull pitcher_mult down
+                recent_form_adj = max(0.92, 1.0 - (1.0 - ratio) * 0.10)
+            else:
+                recent_form_adj = 1.0
+            pitcher_mult = pitcher_mult * recent_form_adj
+            pitcher_mult = max(0.5, min(2.0, pitcher_mult))
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+
+    # NEW: PITCHER DAY/NIGHT adjustment.
+    # Some pitchers are dramatically better at night (or day). Apply a modest
+    # multiplier on pitcher_mult based on their day/night HR rate split.
+    # Capped at ±10% so it doesn't dominate.
+    if game_type in ("day", "night") and pitcher_row is not None:
+        p_dn_pa = pitcher_row.get(f"vs_{game_type}_pa")
+        p_dn_hr = pitcher_row.get(f"vs_{game_type}_hr_per_pa")
+        if (p_dn_pa is not None and not pd.isna(p_dn_pa) and p_dn_pa >= 50
+                and p_dn_hr is not None and not pd.isna(p_dn_hr) and p_dn_hr > 0):
+            # v43.62 (reviewer-validated fix #2.6): shrink the day/night split
+            # toward the PITCHER'S OWN expected rate, not the league average.
+            # The previous formula shrank toward LEAGUE_HR_PER_PA, then ratio'd
+            # against `LEAGUE_HR_PER_PA × pitcher_mult` — for a strong
+            # suppressor (pitcher_mult ≈ 0.7, expected ≈ 0.021), a merely
+            # league-average shrunk-toward-league day/night value (~0.030)
+            # gave ratio > 1 and nudged him back toward neutral. Partial
+            # double-count of the shrinkage already baked into pitcher_mult.
+            # Anchoring shrinkage to the pitcher's own expected rate makes
+            # this adjustment about the split's deviation from HIS OWN form,
+            # not from the league.
+            p_dn_rate = float(p_dn_hr) / 100  # pct → decimal
+            expected_pitcher_rate = LEAGUE_HR_PER_PA * pitcher_mult
+            # Shrinkage: 60 PA prior toward the pitcher's own expected rate
+            shrink_w = float(p_dn_pa) / (float(p_dn_pa) + 60)
+            p_dn_shrunk = p_dn_rate * shrink_w + expected_pitcher_rate * (1 - shrink_w)
+            # Ratio of pitcher's split to his own expected rate.
+            # If pitcher_mult is 0.7 (suppressor), expected rate is 0.7 × LEAGUE.
+            # A day/night split that matches that exactly → ratio 1.0, no nudge.
+            # A split that EXCEEDS his own expected → he's slightly worse at this time.
+            if expected_pitcher_rate > 0:
+                dn_ratio = p_dn_shrunk / expected_pitcher_rate
+                dn_ratio = max(0.90, min(1.10, dn_ratio))
+                pitcher_mult = pitcher_mult * (1.0 + (dn_ratio - 1.0) * 0.50)
+                pitcher_mult = max(0.5, min(2.0, pitcher_mult))
+
+    # GROUND BALL DAMPENER (June 2026)
+    # Pitchers with high ground-ball rates physically suppress HRs because
+    # ground balls don't leave the yard. The pitcher_mult derived above
+    # captures HR/9 directly, but HR/9 lags real GB tendency — early-season
+    # GB pitchers might have an inflated HR/9 from a few flyball outliers.
+    #
+    # We apply a small explicit dampener:
+    #   GB% 45-50%: -2.5% pitcher_mult (above-average GB pitcher)
+    #   GB% 50-55%: -5% pitcher_mult (strong GB pitcher)
+    #   GB% 55%+:   -7.5% pitcher_mult (elite GB suppressor)
+    # Symmetric on the flyball side:
+    #   GB% 35-40%: +2.5% pitcher_mult (flyball-prone)
+    #   GB% 30-35%: +5% pitcher_mult (heavy flyball pitcher)
+    #   GB% <30%:   +7.5% pitcher_mult (extreme flyball, HR-prone)
+    # League avg GB% ≈ 43%. Multiplier neutral at 40-45%.
+    gb_pct_raw = None
+    if pitcher_row is not None:
+        for key in ("gb_pct", "groundballs_percent", "gb_allowed"):
+            v = pitcher_row.get(key)
+            if v is not None:
+                try:
+                    gb_pct_raw = float(v)
+                    break
+                except (TypeError, ValueError):
+                    continue
+    if gb_pct_raw is not None and not pd.isna(gb_pct_raw):
+        if gb_pct_raw >= 55:
+            pitcher_mult *= 0.925
+        elif gb_pct_raw >= 50:
+            pitcher_mult *= 0.95
+        elif gb_pct_raw >= 45:
+            pitcher_mult *= 0.975
+        elif gb_pct_raw < 30:
+            pitcher_mult *= 1.075
+        elif gb_pct_raw < 35:
+            pitcher_mult *= 1.05
+        elif gb_pct_raw < 40:
+            pitcher_mult *= 1.025
+        # Re-clamp
+        pitcher_mult = max(0.5, min(2.0, pitcher_mult))
+
+    # PLATOON ADVANTAGE multiplier
+    # Real MLB data: opposite-handed matchups produce ~12% more HRs than same-side
+    # (LHB vs RHP: 1.07x baseline; LHB vs LHP: 0.94x; RHB vs LHP: 1.06x; RHB vs RHP: 0.96x)
+    # Switch hitters get the favorable side, so always neutral or slightly +
+    #
+    # NOTE: If we're already using a HANDEDNESS-SPLIT pitcher_mult above,
+    # we should dampen the platoon mult to avoid double-counting.
+    # Real splits already encode the platoon effect in the data.
+    # v43.65 (reviewer fix P-B): the dampener now triggers when EITHER
+    # the hitter-split OR the pitcher-split has been applied. Previously
+    # only watched split_hr_per_pa (pitcher-split), so when the hitter-split
+    # was applied (block 1, line ~238) but pitcher-split was absent, the
+    # full platoon multiplier got stacked on top of the already-applied
+    # hitter-split. Hitter-splits are ~15× more common than pitcher-splits
+    # in production (the reviewer's export showed 404 vs 27), so this was
+    # the dominant code path. Now either signal triggers dampening.
+    _any_split_applied = (
+        split_hr_per_pa is not None
+        or _hitter_split_applied
+    )
+    platoon_mult = 1.0
+    p_throws = (pitcher_row.get("p_throws") or pitcher_row.get("throws") or "").upper() if pitcher_row else ""
+    if h_bats and p_throws and h_bats != "S":
+        # If we have real splits (either side), the data already shows the
+        # platoon effect. Use a smaller residual platoon adjustment.
+        if _any_split_applied:
+            # Splits used - reduce platoon impact to 1/3 to capture league avg residual
+            if h_bats != p_throws:
+                platoon_mult = 1.025 if h_bats == "L" else 1.020
+            else:
+                platoon_mult = 0.980 if h_bats == "L" else 0.985
+        else:
+            # No splits available - full platoon adjustment
+            if h_bats != p_throws:
+                platoon_mult = 1.07 if h_bats == "L" else 1.06
+            else:
+                platoon_mult = 0.94 if h_bats == "L" else 0.96
+    elif h_bats == "S" and p_throws in ("L", "R"):
+        # Switch hitters ALWAYS bat from the favorable side, so they always get
+        # the platoon advantage. If we already pulled the opposite-side split
+        # above (the typical case now), the data encodes it — use a small residual.
+        # If no splits available, give the full opposite-side bonus.
+        if _any_split_applied:
+            # Residual after splits already applied (smaller)
+            platoon_mult = 1.022  # avg of L/R favorable values
+        else:
+            # No splits — give the full opposite-side bonus
+            platoon_mult = 1.065  # avg of L/R favorable values
+
+    # Pitch match adjustment - only if we have a real score
+    # Was: 0.6-1.6 range, too generous (gave non-power hitters huge boosts)
+    # Now: 0.75-1.30 range — meaningful but doesn't substitute for raw power
+    pm_mult = 1.0
+    if pitch_match_score is not None and not pd.isna(pitch_match_score):
+        # 50 = neutral. Each point above adds 0.6% boost; each below subtracts.
+        pm_mult = 1.0 + (pitch_match_score - 50) * 0.006
+        pm_mult = max(0.75, min(1.30, pm_mult))
+
+    # Compute hitter-side context multiplier (everything BUT pitcher_mult and h_base).
+    # Cap it to prevent inflation when multiple small boosts compound.
+    # Example bug fix: 1.17 wind × 1.21 park × 1.30 pitch_match = 1.84x
+    # compounded multiplier was pushing modest hitters to elite tier.
+    # New cap: 1.35× total context (still allows great matchups to boost ~35%).
+    # v43.24 (reviewer-validated double-count fix): day_night_mult removed
+    # from this stack — the day/night adjustment happens once in the
+    # h_base block below (principled per-hitter shrinkage). Prior v43.18
+    # had day_night appearing in BOTH places, compounding ±25%.
+    ctx_mult_raw = (
+        park_factor
+        * park_hand_factor
+        * weather_mult
+        * pm_mult
+        * ttop_mult
+        * defense_factor
+        * platoon_mult
+    )
+    ctx_mult = min(1.35, max(0.65, ctx_mult_raw))
+
+    prob = (
+        h_base
+        * pitcher_mult
+        * ctx_mult
+    )
+    # Use a SOFT squash that asymptotes at a REALISTIC ceiling.
+    # Reference: Aaron Judge's actual rate of "at-least-1-HR in a game" peaked
+    # at ~25% in his 62-HR 2022 season. Schwarber/Olson 2024 hit 24.4%/24.3%.
+    #
+    # CALIBRATION (May 2026): loosened from 0.030/0.040 → 0.032/0.045 to bring
+    # elite hitter game% up to 24-26% range matching real MLB data. Previous
+    # caps had Schwarber at ~22.6% game (real 24.4%) — systematically 1-2pp low.
+    #
+    # Behavior:
+    #   - Below 4% per PA: linear pass-through (no squash)
+    #   - 4-5%: gentle squash (some compression)
+    #   - 5-7%: stronger squash (most differentiation happens here)
+    #   - Theoretical asymptote: 7.2% per PA (tanh→1.0 in the limit)
+    #   - PRACTICAL ceiling: ~6.7% per PA in realistic input range.
+    #     Per-game max: 1 - (1-0.067)^4.2 ≈ 25.4% — matches Schwarber-tier real rate.
+    if prob <= 0.04:
+        squashed = prob
+    else:
+        excess = prob - 0.04
+        # Tanh squash: theoretical asymptote at 0.032 (theoretical max = 7.2% per PA).
+        # Scale parameter 0.045 (was 0.040) widens the differentiation band, so
+        # 6%/PA input → 5.5% out (was 5.4%), 8%/PA → 6.4% (was 6.3%), 12%/PA → 6.9%.
+        squashed = 0.04 + 0.032 * np.tanh(excess / 0.045)
+    return float(max(0.001, squashed))
 
 
 def hr_prob_full_game(prob_per_pa: float | None, expected_pa: float = 4.2) -> float | None:
+    """
+    P(at least 1 HR in the game) = 1 - (1 - p_pa) ^ PA.
+    Returns None if input is None (no real projection possible).
+    """
     if prob_per_pa is None or pd.isna(prob_per_pa):
         return None
     return float(1 - (1 - prob_per_pa) ** expected_pa)
 
 
-def add_hr_probabilities(frame: pd.DataFrame) -> pd.DataFrame:
-    out = frame.copy()
-    expected_pa = pd.to_numeric(out.get("lineup_pos", pd.Series(5, index=out.index)), errors="coerce").map(lambda spot: 4.65 - min(max((spot if pd.notna(spot) else 5) - 1, 0), 8) * .09)
-    # env_boost includes the hand-aware park factor plus weather. Prefer it so
-    # the stated game probability and visible environment column agree.
-    rates = [hr_prob_per_pa(row, row.get("env_boost", row.get("park_factor", 1.0)), row.get("pitcher_hr9")) for row in out.to_dict("records")]
-    out["model_hr_pa_pct"] = pd.Series(rates, index=out.index) * 100
-    out["model_hr_game_pct"] = [hr_prob_full_game(rate, pa) * 100 if rate is not None else float("nan") for rate, pa in zip(rates, expected_pa)]
-    return out
+# ============================================================================
+# v43.27 — HIT probability signal (parallel to HR signal, orthogonal use case)
+# ============================================================================
+# The HR machinery above scores power outcomes. This block scores HIT
+# outcomes — useful for differentiating Schwarber-shape (high HR, low hit)
+# from Arraez-shape (no HR, lots of hits) when picking for "any-hit" props
+# versus "HR" props.
+#
+# Architecture: completely separate from HR scoring. Doesn't touch
+# pick_score, hr_grade, or any HR-side multiplier. Hit signal lives in its
+# own columns (hit_pa_pct, hit_game_pct, hit_grade, hit_alert) for users
+# who want to differentiate the two questions.
+#
+# Math is simpler than HR: hits stabilize faster than power, the dynamic
+# range is narrower (~50%-80% per game vs ~5%-25% for HR), and the
+# multiplier stack is smaller (no pull-side, no wind, no LA target).
+# ============================================================================
+
+LEAGUE_HIT_PER_PA = 0.235  # ~0.250 BA × ~0.91 AB/PA average
+
+def hit_prob_per_pa(
+    hitter_row: dict,
+    pitcher_row: dict,
+    park_hits_factor: float = 1.0,
+    platoon_mult: float = 1.0,
+    min_pa: int = 25,
+) -> float | None:
+    """
+    Per-PA probability that this hitter gets a hit in this matchup.
+
+    INPUTS (all from existing data we already fetch):
+      - xba (expected batting average from Statcast, contact-quality based)
+      - ba (actual batting average — fallback if xba absent)
+      - k_pct / k_percent (penalty proxy — high K caps hit ceiling)
+      - pitcher BAA or h_per_9 (pitcher allow rate)
+      - park hits factor (different from park HR factor)
+
+    Returns None if hitter has insufficient PA.
+    """
+    if not isinstance(hitter_row, dict):
+        try:
+            hitter_row = dict(hitter_row)
+        except Exception:
+            return None
+
+    # v43.62 (reviewer fix #2.8 + #2.9):
+    pa = _first_non_null(hitter_row.get("pa"), hitter_row.get("PA"), 0)
+    try:
+        if pa is None or pd.isna(pa):
+            return None
+        pa_f = float(pa)
+    except (TypeError, ValueError):
+        return None
+    if pa_f < min_pa:
+        return None
+
+    # Hitter side — prefer xBA (predictive) over BA (descriptive).
+    # v43.27 FIX (from discipline-bug lesson): read BOTH possible column
+    # names since build_matchup_table renames some but not all.
+    # v43.62: _first_non_null is NaN-safe; `or` chains weren't (NaN is truthy).
+    xba = _first_non_null(hitter_row.get("xba"), hitter_row.get("xBA"))
+    ba = _first_non_null(
+        hitter_row.get("ba"),
+        hitter_row.get("BA"),
+        hitter_row.get("batting_avg"),
+    )
+
+    try:
+        xba_f = float(xba) if xba is not None and not pd.isna(xba) else None
+        ba_f = float(ba) if ba is not None and not pd.isna(ba) else None
+    except (TypeError, ValueError):
+        xba_f, ba_f = None, None
+
+    if xba_f is not None and ba_f is not None:
+        # Blend: xBA weighted higher (more predictive of next-game performance)
+        hitter_ba = xba_f * 0.6 + ba_f * 0.4
+    elif xba_f is not None:
+        hitter_ba = xba_f
+    elif ba_f is not None:
+        hitter_ba = ba_f
+    else:
+        # No BA data — fall back to league average
+        hitter_ba = 0.250
+
+    # Convert BA to hit-per-PA: BA × (AB/PA). For most hitters AB/PA ≈ 0.91
+    # (subtracting BB/HBP/SH/SF). Use the hitter's actual if available.
+    # v43.65 (reviewer fix P-A): _first_non_null is NaN-safe; the previous
+    # `or` chain short-circuited on NaN (which is truthy in Python's bool
+    # context). The default value 8.0 was unreachable when bb_pct was NaN
+    # — it landed at the float() conversion below which then caught the
+    # NaN and fell to except. Same logic, but cleaner: now the fallback
+    # actually runs at the picker step.
+    bb_pct = _first_non_null(
+        hitter_row.get("bb_pct"),
+        hitter_row.get("bb_percent"),
+        8.0,
+    )
+    try:
+        bb_f = float(bb_pct)
+    except (TypeError, ValueError):
+        bb_f = 8.0
+    ab_per_pa = max(0.80, min(0.95, 1.0 - bb_f/100 - 0.02))  # -2% for HBP/SH/SF
+
+    hitter_h_per_pa = hitter_ba * ab_per_pa
+
+    # K% penalty — high-K hitters cap their hit ceiling. A hitter at 30% K
+    # never reaches their xBA in practice because 30% of PAs end without
+    # contact at all. Already implicit in xBA but apply a small additional
+    # correction for extreme cases.
+    # v43.65 (reviewer fix P-A): NaN-safe lookup, same reasoning as bb_pct above.
+    k_pct = _first_non_null(
+        hitter_row.get("k_pct"),
+        hitter_row.get("k_percent"),
+    )
+    if k_pct is not None:
+        try:
+            k_f = float(k_pct)
+            # If K > 28%, apply a small dampener (5-10%)
+            if k_f > 28:
+                hitter_h_per_pa *= max(0.90, 1.0 - (k_f - 28) * 0.015)
+        except (TypeError, ValueError):
+            pass
+
+    # Pitcher side — use BAA (batting average against) if available, else
+    # derive from h_per_9 / batters_faced_per_9.
+    # v43.29 (reviewer-validated CRITICAL fix): the pitcher row from
+    # get_pitcher_stats stores the BAA value under "batting_avg" (it's
+    # batting average ALLOWED on pitcher rows). Previously this function
+    # looked for "baa"/"BAA"/"h9" only — never found them — so pitcher_mult
+    # always defaulted to 1.0 and the hit signal lost the pitcher dimension
+    # entirely. Adding the actual column name as a fallback.
+    # v43.62: _first_non_null is NaN-safe; the `or` chains weren't.
+    p_baa = None
+    if pitcher_row is not None:
+        try:
+            p_baa = _first_non_null(
+                pitcher_row.get("baa"),
+                pitcher_row.get("BAA"),
+                pitcher_row.get("batting_avg"),   # v43.29 fix
+                pitcher_row.get("avg"),
+            )
+            if p_baa is not None:
+                p_baa = float(p_baa)
+            else:
+                # Fallback derive: H/9 / typical 38 BF per 9 IP
+                h9 = _first_non_null(
+                    pitcher_row.get("h9"), pitcher_row.get("h_per_9"),
+                )
+                if h9 is not None:
+                    p_baa = float(h9) / 38.0
+        except (TypeError, ValueError):
+            p_baa = None
+
+    # Pitcher multiplier: ratio of pitcher's BAA to league avg (.250)
+    if p_baa is not None and 0.150 < p_baa < 0.400:
+        pitcher_mult = p_baa / 0.250
+        # Cap at [0.75, 1.30] — pitchers don't suppress hits as much as HRs
+        pitcher_mult = max(0.75, min(1.30, pitcher_mult))
+    else:
+        pitcher_mult = 1.0
+
+    # Park hits factor (separate from park HR factor — supplied by caller)
+    # Cap [0.92, 1.10] — park effect on hits is smaller than on HRs
+    park_mult = max(0.92, min(1.10, float(park_hits_factor)))
+
+    # Platoon for hits is weaker than for HRs (same-side BA penalty ≈ 5-10%)
+    # Caller passes platoon_mult already capped
+    platoon_clamped = max(0.92, min(1.10, float(platoon_mult)))
+
+    hit_pa = hitter_h_per_pa * pitcher_mult * park_mult * platoon_clamped
+
+    # Bound result — no hitter has >0.45 hit-per-PA (would be 0.450 BA)
+    hit_pa = max(0.10, min(0.45, hit_pa))
+    return float(hit_pa)
+
+
+def hit_prob_full_game(prob_per_pa: float | None, expected_pa: float = 4.2) -> float | None:
+    """
+    P(at least 1 hit in the game) = 1 - (1 - hit_pa) ^ PA.
+    """
+    if prob_per_pa is None or pd.isna(prob_per_pa):
+        return None
+    return float(1 - (1 - prob_per_pa) ** expected_pa)
+
+
+def hit_grade(hit_game_pct):
+    """
+    Letter grade for hit probability. Calibrated to hit-game baseline ~65%.
+
+    Real-world reference (1+ hit per 4.2 PA):
+      Arraez 2024: ~78% hit rate
+      Soto/Judge elite: ~72-75%
+      Average regular: ~62-68%
+      High-K profile: ~50-55%
+
+    A+ : ≥78%  (elite contact, Arraez-tier)
+    A  : 72-78% (strong contact)
+    B+ : 66-72% (above average)
+    B  : 58-66% (solid — typical regular)
+    C+ : 50-58% (below average)
+    C  : 42-50% (weak — high-K profile or struggling)
+    D  : 32-42% (poor)
+    F  : <32%   (avoid — bench / cold)
+    """
+    if hit_game_pct is None or pd.isna(hit_game_pct):
+        return "—"
+    if hit_game_pct >= 78: return "A+"
+    if hit_game_pct >= 72: return "A"
+    if hit_game_pct >= 66: return "B+"
+    if hit_game_pct >= 58: return "B"
+    if hit_game_pct >= 50: return "C+"
+    if hit_game_pct >= 42: return "C"
+    if hit_game_pct >= 32: return "D"
+    return "F"
+
+
+def hit_signal_emoji(hit_game_pct):
+    """Color signal for hit probability (parallel to HR signal)."""
+    if hit_game_pct is None or pd.isna(hit_game_pct):
+        return "⚪"
+    if hit_game_pct >= 72: return "🟢"
+    if hit_game_pct >= 58: return "🟡"
+    if hit_game_pct >= 42: return "🟠"
+    return "🔴"
+
+
+# ============================================================================
+# v43.38 — TOTAL BASES signal (user-requested)
+# ============================================================================
+# Estimates expected total bases per game (singles=1, doubles=2, triples=3,
+# HR=4, walks=0/excluded per user request — SLG already excludes BB by
+# definition: SLG = TB / AB).
+# ============================================================================
+
+LEAGUE_SLG = 0.410
+
+def total_bases_per_pa(hitter_row, pitcher_row,
+                        park_hits_factor=1.0, platoon_mult=1.0, min_pa=25):
+    """Expected total bases per PA (excludes walks).
+    Uses xSLG (predictive) anchored, adjusted by pitcher SLG-against, park,
+    platoon. Returns None for sub-min_pa hitters.
+    """
+    if not isinstance(hitter_row, dict):
+        try:
+            hitter_row = dict(hitter_row)
+        except Exception:
+            return None
+    # v43.62 (reviewer fix #2.8 + #2.9):
+    #   #2.8: _first_non_null replaces NaN-vulnerable `or` chain
+    #   #2.9: NaN PA was passing the `< min_pa` gate (NaN comparisons return
+    #         False), so unknown-PA hitters got a full league projection
+    #         instead of None. Explicit pd.isna guard added.
+    pa = _first_non_null(hitter_row.get("pa"), hitter_row.get("PA"), 0)
+    try:
+        if pa is None or pd.isna(pa) or float(pa) < min_pa:
+            return None
+    except (TypeError, ValueError):
+        return None
+
+    xslg = _first_non_null(hitter_row.get("xslg"), hitter_row.get("xSLG"))
+    slg = _first_non_null(hitter_row.get("slg"), hitter_row.get("SLG"))
+    try:
+        xslg_f = float(xslg) if xslg is not None else None
+        slg_f = float(slg) if slg is not None else None
+    except (TypeError, ValueError):
+        xslg_f, slg_f = None, None
+    if xslg_f is not None and slg_f is not None:
+        hitter_slg = xslg_f * 0.6 + slg_f * 0.4
+    elif xslg_f is not None:
+        hitter_slg = xslg_f
+    elif slg_f is not None:
+        hitter_slg = slg_f
+    else:
+        hitter_slg = LEAGUE_SLG
+
+    # v43.65 (reviewer fix P-A): _first_non_null is NaN-safe; same fix as
+    # in hit_prob_per_pa above.
+    bb_pct = _first_non_null(
+        hitter_row.get("bb_pct"),
+        hitter_row.get("bb_percent"),
+        8.0,
+    )
+    try:
+        bb_f = float(bb_pct)
+    except (TypeError, ValueError):
+        bb_f = 8.0
+    ab_per_pa = max(0.80, min(0.95, 1.0 - bb_f/100 - 0.02))
+
+    base = hitter_slg * ab_per_pa
+
+    # Pitcher adjustment — SLG-against or proxy
+    # v43.54 (reviewer-validated CRITICAL fix): pitcher rows from
+    # build_pitcher_slate DO NOT have "slg_against" or "slg" columns.
+    # What they DO have:
+    #   - vs_lhb_slg / vs_rhb_slg (handedness-split SLG ALLOWED — copied
+    #     from raw pitcher_stats via the explicit vs_lhb_*/vs_rhb_* loop)
+    #   - xwoba_allowed (expected wOBA the pitcher has allowed)
+    #   - barrel_allowed, hard_hit_allowed (Statcast contact-quality allowed)
+    # Previously this function read non-existent "slg_against"/"slg", got
+    # None, fell to BAA branch (also non-existent on pitcher rows from
+    # build_pitcher_slate), got None — pitcher_mult always = 1.0. Total
+    # bases was pitcher-blind for every hitter on every slate.
+    pitcher_mult = 1.0
+    if pitcher_row is not None:
+        try:
+            # Priority 1: handedness-specific SLG-allowed. This is the
+            # closest direct match to "what does this pitcher give up
+            # when facing THIS hitter's handedness". Use the hitter's bats.
+            bats = (hitter_row.get("bats") or "R")
+            try:
+                bats = str(bats).upper()
+            except Exception:
+                bats = "R"
+            p_slg = None
+            if bats == "L":
+                p_slg = pitcher_row.get("vs_lhb_slg")
+            elif bats == "R":
+                p_slg = pitcher_row.get("vs_rhb_slg")
+            elif bats == "S":
+                # Switch hitter — average the two
+                lhb = pitcher_row.get("vs_lhb_slg")
+                rhb = pitcher_row.get("vs_rhb_slg")
+                vals = [v for v in (lhb, rhb)
+                        if v is not None and not pd.isna(v)]
+                if vals:
+                    p_slg = sum(float(v) for v in vals) / len(vals)
+            # If handedness-specific missing, use combined-handedness fallback
+            # (very rare for pitchers with any sample, but defensive).
+            if p_slg is None or (isinstance(p_slg, float) and pd.isna(p_slg)):
+                # Try the two and average if either present
+                lhb = pitcher_row.get("vs_lhb_slg")
+                rhb = pitcher_row.get("vs_rhb_slg")
+                vals = [v for v in (lhb, rhb)
+                        if v is not None and not pd.isna(v)]
+                if vals:
+                    p_slg = sum(float(v) for v in vals) / len(vals)
+
+            if p_slg is not None and not pd.isna(p_slg):
+                p_f = float(p_slg)
+                if 0.250 < p_f < 0.700:
+                    pitcher_mult = p_f / LEAGUE_SLG
+            else:
+                # Priority 2: xwoba_allowed as proxy. xwOBA→SLG isn't
+                # 1:1 but they correlate ~0.85. Empirically across the
+                # league SLG ≈ xwOBA × 1.28 (league xwOBA ~0.320,
+                # league SLG ~0.410). Use that ratio to project SLG-against.
+                p_xwoba = pitcher_row.get("xwoba_allowed")
+                if p_xwoba is not None and not pd.isna(p_xwoba):
+                    p_xw_f = float(p_xwoba)
+                    if 0.250 < p_xw_f < 0.500:
+                        proj_slg = p_xw_f * 1.28
+                        pitcher_mult = proj_slg / LEAGUE_SLG
+                else:
+                    # Priority 3: barrel_allowed as last-resort proxy.
+                    # League ~7-8% barrel. Each +1% barrel → ~+0.020 SLG.
+                    # Anchor at .410 SLG = 7.5% barrel.
+                    p_brl = pitcher_row.get("barrel_allowed")
+                    if p_brl is not None and not pd.isna(p_brl):
+                        p_brl_f = float(p_brl)
+                        if 0 <= p_brl_f <= 25:
+                            proj_slg = 0.410 + (p_brl_f - 7.5) * 0.020
+                            if 0.250 < proj_slg < 0.700:
+                                pitcher_mult = proj_slg / LEAGUE_SLG
+        except (TypeError, ValueError):
+            pass
+    pitcher_mult = max(0.70, min(1.35, pitcher_mult))
+    park_mult = max(0.92, min(1.10, float(park_hits_factor)))
+    platoon_clamped = max(0.90, min(1.12, float(platoon_mult)))
+
+    bases_pa = base * pitcher_mult * park_mult * platoon_clamped
+    return float(max(0.10, min(1.40, bases_pa)))
+
+
+def total_bases_per_game(bases_pa, expected_pa=4.2):
+    """Expected total bases for the game (linear bases_pa × PA)."""
+    if bases_pa is None or pd.isna(bases_pa):
+        return None
+    return float(bases_pa * expected_pa)
+
+
+def total_bases_grade(expected_bases):
+    """Grade for expected bases per game.
+    League avg ~1.55 (SLG .410 × 0.91 AB/PA × 4.2 PA).
+    A+ ≥ 2.3 / A ≥ 2.0 / B+ ≥ 1.8 / B ≥ 1.6 / C+ ≥ 1.4 / C ≥ 1.2 / D ≥ 1.0 / F <1.0
+    """
+    if expected_bases is None or pd.isna(expected_bases):
+        return "—"
+    if expected_bases >= 2.3: return "A+"
+    if expected_bases >= 2.0: return "A"
+    if expected_bases >= 1.8: return "B+"
+    if expected_bases >= 1.6: return "B"
+    if expected_bases >= 1.4: return "C+"
+    if expected_bases >= 1.2: return "C"
+    if expected_bases >= 1.0: return "D"
+    return "F"
+
+
+def k_total_projection(
+    pitcher_row: dict,
+    opp_lineup_k_pct: float | None,
+    ump_k_factor: float = 1.0,
+    catcher_framing_factor: float = 1.0,
+    park_k_factor: float = 1.0,
+    expected_ip: float = 5.5,
+    recent_k9_weight: float = 0.35,
+) -> dict:
+    """
+    Project pitcher K total using only real data.
+    Returns dict with mean=None if insufficient data.
+    """
+    if not pitcher_row:
+        return {"mean": None}
+
+    # Real season K/9 required
+    season_k9 = pitcher_row.get("k9")
+    if season_k9 is None or pd.isna(season_k9) or season_k9 == 0:
+        return {"mean": None}
+
+    recent_k9 = pitcher_row.get("recent_k9")
+    if recent_k9 is not None and not pd.isna(recent_k9) and recent_k9 > 0:
+        blended_k9 = recent_k9 * recent_k9_weight + season_k9 * (1 - recent_k9_weight)
+    else:
+        blended_k9 = season_k9  # no recent data, use season as-is
+
+    # Opposing lineup adjustment - only if real data
+    if opp_lineup_k_pct is None or pd.isna(opp_lineup_k_pct):
+        lineup_adj = 1.0  # no adjustment when we don't have it
+    else:
+        # 2024-2025 league-avg K rate is ~22.5%. Using 22 here gave every K
+        # projection a +2.3% upward bias for league-average lineups.
+        lineup_adj = opp_lineup_k_pct / 22.5
+
+    proj_k9 = (
+        blended_k9
+        * lineup_adj
+        * ump_k_factor
+        * catcher_framing_factor
+        * park_k_factor
+    )
+
+    mean = proj_k9 * expected_ip / 9
+    # Empirical sigma for a single start: ~35% of mean (verified vs historical data)
+    # Min sigma of 1.4 K to handle low-K projections
+    sigma = max(mean * 0.35, 1.4)
+
+    def p_over(line):
+        """
+        P(K total > line). Lines like 5.5 mean "more than 5.5 strikeouts",
+        i.e. 6 or more, so we DON'T add a continuity correction since line is
+        already at the half-integer.
+
+        HYBRID: for low-K projections (mean < 5, typically openers/swing-men),
+        the Normal approximation diverges from the true discrete distribution
+        by 3-5 percentage points. Use Poisson for these. At K≥5 the Normal
+        approximation is accurate enough for prop pricing.
+        """
+        from math import erf, sqrt
+        if mean < 5:
+            # Poisson is the right discrete distribution for rare-event counts.
+            # P(K > line) = P(K >= ceil(line)) since K is integer.
+            from math import factorial, exp
+            k_min = int(line + 0.999)  # ceil for half-integer lines (5.5 → 6)
+            if mean <= 0:
+                return 0.0
+            # Compute P(K < k_min) = sum_{i=0}^{k_min-1} e^-λ λ^i / i!
+            cum = 0.0
+            for i in range(k_min):
+                cum += exp(-mean) * (mean ** i) / factorial(i)
+            return max(0.0, min(1.0, 1.0 - cum))
+        if sigma <= 0:
+            return 0.5
+        z = (line - mean) / (sigma * sqrt(2))
+        return float(1 - 0.5 * (1 + erf(z)))
+
+    return {
+        "mean": round(mean, 2),
+        "low": round(mean - sigma, 2),
+        "high": round(mean + sigma, 2),
+        "sigma": round(sigma, 2),
+        "blended_k9": round(blended_k9, 2),
+        "lineup_adj": round(lineup_adj, 3),
+        "p_over_5.5": round(p_over(5.5), 3),
+        "p_over_6.5": round(p_over(6.5), 3),
+        "p_over_7.5": round(p_over(7.5), 3),
+        "p_over_8.5": round(p_over(8.5), 3),
+    }
+
+
+def implied_prob_from_american(odds: int) -> float:
+    """Convert American odds to implied probability (with vig).
+
+    v43.62 (reviewer fix #2.10): guard against odds=0 (never a real line,
+    but one stray 0 from upstream parsing would raise ZeroDivisionError).
+    """
+    if odds is None or odds == 0:
+        return None
+    if odds < 0:
+        return -odds / (-odds + 100)
+    return 100 / (odds + 100)
+
+
+def american_from_prob(p: float) -> int:
+    """Inverse: probability → American odds (fair, no vig)."""
+    if p is None or p <= 0 or p >= 1:
+        return None
+    if p >= 0.5:
+        return int(round(-p / (1 - p) * 100))
+    return int(round((1 - p) / p * 100))
+
+
+def verdict_color(score: float, scale: tuple = (40, 60)) -> str:
+    """
+    Convert any 0-100 score into a stoplight verdict.
+      < scale[0]   = 🔴 Fade
+      < scale[1]   = 🟡 Neutral
+      ≥ scale[1]   = 🟢 Smash
+    """
+    if score is None or pd.isna(score):
+        return "—"
+    if score >= scale[1]:
+        return "🟢"
+    if score >= scale[0]:
+        return "🟡"
+    return "🔴"
