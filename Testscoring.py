@@ -1,0 +1,50 @@
+"""Tests for scoring.py — locks in behavior so future refactors can't silently
+change the model. Run: python3 -m pytest test_scoring.py -q"""
+import pandas as pd, numpy as np
+from datetime import date
+import scoring
+
+
+def test_smash_tier_requires_exploit_pitcher():
+    # MIXED pitcher never qualifies (matches the legend)
+    assert scoring.smash_tier(90, "MIXED", 1.10, True) == ""
+    # EXPLOIT+ with high score + favorable env = elite smash
+    assert "ELITE SMASH" in scoring.smash_tier(90, "EXPLOIT+", 1.05, True)
+
+def test_smash_tier_hostile_pitcher_blocks():
+    assert scoring.smash_tier(90, "ELITE", 1.20, True) == ""
+    assert scoring.smash_tier(90, "TOUGH", 1.20, True) == ""
+
+def test_smash_tier_unconfirmed_lineup_blocks():
+    assert scoring.smash_tier(90, "EXPLOIT", 1.05, False) == ""
+
+def test_smash_tier_low_score_blocks():
+    assert scoring.smash_tier(50, "EXPLOIT", 1.10, True) == ""
+
+def test_hr_grade_tiers():
+    assert scoring.hr_grade(25.0, 200) == "A+"
+    assert scoring.hr_grade(3.0, 30) == "F"
+
+def test_pitcher_grade_maps_correctly():
+    # high test_score = tough/elite pitcher; low = exploitable
+    assert scoring.pitcher_grade(90, sample_size=100) == "ELITE"
+    assert scoring.pitcher_grade(30, sample_size=100) == "EXPLOIT+"
+
+def test_dinger_score_percentile_ranks():
+    df = pd.DataFrame({
+        "pulled_brl_pct":[10,5,15], "avg_ev":[92,88,95], "barrel_pct":[12,6,18],
+        "hard_hit":[45,35,55], "iso":[0.25,0.15,0.35], "blast_pct":[8,4,12],
+    })
+    ds = scoring.compute_dinger_score(df, context=False)
+    # highest-power hitter (row 2) should score top
+    assert ds.iloc[2] == ds.max()
+    assert ds.iloc[1] == ds.min()
+
+def test_dinger_weights_sum_stable():
+    # reweight-02 generation — locked value
+    assert abs(sum(scoring.DINGER_BASE_WEIGHTS.values()) - 10.0) < 1e-9
+
+def test_smash_thresholds_locked():
+    assert scoring.SMASH_ELITE_SCORE == 85
+    assert scoring.SMASH_STRONG_SCORE == 75
+    assert scoring.SMASH_BASE_SCORE == 65
