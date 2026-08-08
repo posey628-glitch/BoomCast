@@ -1,201 +1,5552 @@
-"""Small, reliable public-data adapter for LaunchCast."""
+"""
+data_fetcher.py
+================
+Pulls today's MLB slate and all underlying data from free public sources:
+  - MLB Stats API (statsapi.mlb.com) - slate, probable pitchers, lineups
+  - Baseball Savant (baseballsavant.mlb.com) - Statcast stats, arsenals
+
+No API keys required. All endpoints are publicly documented.
+Results are cached via Streamlit's @st.cache_data with TTLs tuned per source:
+  - Slate (probable pitchers): 5 min
+  - Lineups: 3 min
+  - Active rosters: 15 min
+  - Season Statcast stats: 1 hour AND rolls over daily at 5 AM ET
+"""
+
 from __future__ import annotations
 
-from datetime import date
 import io
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, date, timedelta, timezone
+from typing import Optional
 
 import pandas as pd
 import requests
+import re
 import streamlit as st
-from park_factors import get_park, get_park_hand_factor
-from weather import fetch_weather, hr_multiplier
-
-HEADERS = {"User-Agent": "LaunchCast/1.0 (+public-data-dashboard)", "Accept": "application/json, text/csv, */*"}
-TIMEOUT = 20
-LINEUP_TIMEOUT = 8
 
 
-def _get(url: str, timeout: int = TIMEOUT) -> requests.Response:
-    response = requests.get(url, headers=HEADERS, timeout=timeout)
-    response.raise_for_status()
-    return response
+def _stats_day_key() -> str:
+    """Return a cache-buster string that changes once per day at 5 AM ET.
+
+    Statcast updates with the previous day's batted-ball data around 2-4 AM ET.
+    By rolling our cache key over at 5 AM ET, we guarantee that morning users
+    always get fresh stats from the new day's update — without waiting for the
+    1-hour TTL to expire mid-morning.
+
+    Returns a string like "2026-05-28" (the "stats day"). For times before 5 AM,
+    we return yesterday's date so we don't bust the cache prematurely while
+    Statcast itself is still updating.
+    """
+    try:
+        try:
+            from zoneinfo import ZoneInfo
+            now_et = datetime.now(ZoneInfo("America/New_York"))
+        except Exception:
+            # Fallback: assume UTC-4 (ET in summer); good enough for cache
+            now_et = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=4)
+        # If it's before 5 AM ET, Statcast may still be updating — use yesterday
+        if now_et.hour < 5:
+            return (now_et - timedelta(days=1)).strftime("%Y-%m-%d")
+        return now_et.strftime("%Y-%m-%d")
+    except Exception:
+        return date.today().isoformat()
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def get_slate(game_date: str | None = None) -> pd.DataFrame:
-    """Scheduled MLB games."""
-    game_date = game_date or date.today().isoformat()
-    payload = _get("https://statsapi.mlb.com/api/v1/schedule?"
-                   f"sportId=1&date={game_date}&hydrate=probablePitcher,team").json()
-    rows = []
-    for day in payload.get("dates", []):
-        for game in day.get("games", []):
-            status = game.get("status", {}).get("detailedState", "")
-            if status.lower().startswith(("postponed", "cancelled", "canceled", "forfeit")):
+# Pretend to be a real browser - Savant sometimes 403s on bare requests
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/csv, */*",
+}
+
+def _saber_to_float(v):
+    """v46.02: module-level safe float parse for the new statsapi fetches
+    (sabermetrics/expectedStats/etc.). The existing _to_float is nested inside
+    another function and not importable at module scope."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def current_season() -> int:
+    """v44.62: resolve the season dynamically at CALL time.
+
+    CURRENT_SEASON below is evaluated once at import; a container alive across
+    Jan 1 would then serve last year's season to every fetcher whose default is
+    `season=CURRENT_SEASON` (Python binds defaults once, at def time). Functions
+    that must stay correct across a year boundary default to `season=None` and
+    call current_season() at the top of their body instead.
+    """
+    return datetime.now().year
+
+
+# Kept for back-compat with the many `season: int = CURRENT_SEASON` defaults.
+# NOTE: this is the import-time year. Season-sensitive fetchers should default
+# to None and resolve via current_season() rather than relying on this.
+CURRENT_SEASON = datetime.now().year
+
+
+# ----------------------------------------------------------------------------
+# Defensive helpers (v42s — reviewer-validated reliability/safety wins)
+# ----------------------------------------------------------------------------
+
+def enforce_numeric(df: pd.DataFrame, cols: list) -> pd.DataFrame:
+    """Force a list of columns to numeric dtype, coercing invalid values to NaN.
+
+    Catches the silent corruption case where Savant/MLB Stats API occasionally
+    returns string values like "-.--" or "" in numeric fields. Without this,
+    downstream math operations silently fail or produce nonsensical results.
+    Modifies df in place (and also returns it for chaining).
+    """
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+def clip_outliers(df: pd.DataFrame, caps: dict | None = None) -> pd.DataFrame:
+    """Clamp Statcast/MLB stats to physically-plausible ranges.
+
+    Savant occasionally returns extreme outlier values (e.g., a 90 mph average
+    exit velo for a pitcher with 1 batted ball event). These pollute downstream
+    ranking and modeling. Caps are calibrated to the realistic envelope of MLB
+    performance — values outside these ranges are not skill, they're data noise.
+    Modifies df in place (and also returns it for chaining).
+    """
+    if caps is None:
+        caps = {
+            "barrel_pct": (0, 30),         # league max ~25%, allow buffer
+            "hard_hit": (0, 75),           # league max ~65%
+            "iso": (0, 0.500),             # league max ~.400
+            "la": (-10, 50),               # avg launch angle realistic range
+            "avg_ev": (70, 120),           # exit velocity realistic range
+            "hr9": (0, 6),                 # already capped in models, belt-and-suspenders
+            "barrel_batted_rate": (0, 30),
+            "hard_hit_percent": (0, 75),
+            "avg_best_speed": (70, 120),
+            "launch_speed": (70, 120),
+            "launch_angle": (-10, 50),
+        }
+    for col, (low, high) in caps.items():
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").clip(low, high)
+    return df
+
+
+# ----------------------------------------------------------------------------
+# Zone tier fetchers (v43 — experimental, defensive)
+# ----------------------------------------------------------------------------
+# Savant's swing/take leaderboard categorizes every pitch into one of four
+# zone tiers: Heart, Shadow, Chase, Waste. These fetchers pull each pitcher's
+# % of pitches by tier and each hitter's run value by tier.
+#
+# IMPORTANT: I could not validate the exact endpoint URL/schema from my dev
+# environment (baseballsavant.mlb.com not in allowlist). These fetchers are
+# best-effort based on documented Savant patterns. They return EMPTY DataFrame
+# on any failure so the app falls back to the plate_discipline_flag signal
+# without crashing.
+#
+# If the fetch returns data: zone_fit_flag will populate in matchup tables.
+# If the fetch fails: the field will be empty, plate_discipline_flag still works,
+# and the user can flag the issue for proper investigation.
+
+@st.cache_data(ttl=21600)
+def get_hitter_sweet_spot(season: int, stats_day: str = "") -> pd.DataFrame:
+    """v45.33: Sweet Spot % — share of batted balls in the 8-32° launch-angle
+    window (review P6 recommendation; availability proven by the retired
+    splits.py's working custom-leaderboard URL). ISOLATED fetch on purpose:
+    its own URL means a Savant change here can never break the main hitter
+    fetch. TRACKED-ONLY for now — feeds Section G correlation evidence with
+    ZERO scoring impact, so the reweight measurement stays pure. Returns
+    DataFrame[player_id, sweet_spot_pct] or empty on any failure."""
+    url = (
+        f"https://baseballsavant.mlb.com/leaderboard/custom"
+        f"?year={season}&type=batter&filter=&min=30"
+        f"&selections=player_id,pa,sweet_spot_percent"
+        f"&chart=false&x=pa&y=pa&r=no&csv=true"
+    )
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=25)
+        r.raise_for_status()
+        if not r.text or len(r.text) < 100:
+            return pd.DataFrame()
+        df = pd.read_csv(io.StringIO(r.text))
+        if df.empty:
+            return pd.DataFrame()
+        col_map = {}
+        for c in df.columns:
+            cl = c.lower().replace(" ", "_")
+            if cl in ("player_id", "playerid", "id", "mlb_id"):
+                col_map["player_id"] = c
+            elif "sweet_spot" in cl:
+                col_map["ss"] = c
+        if "player_id" not in col_map or "ss" not in col_map:
+            return pd.DataFrame()
+        out = pd.DataFrame()
+        out["player_id"] = pd.to_numeric(df[col_map["player_id"]], errors="coerce").astype("Int64")
+        out["sweet_spot_pct"] = pd.to_numeric(df[col_map["ss"]], errors="coerce")
+        out = out.dropna(subset=["player_id"])
+        # value-level guard (v45.19 pattern): all-NaN = fetch miss, not a merge
+        if not _has_real_values(out, "sweet_spot_pct", min_n=20):
+            return pd.DataFrame()
+        return out
+    except Exception:
+        return pd.DataFrame()
+
+
+def _has_real_values(df: pd.DataFrame, col: str, min_n: int = 20) -> bool:
+    """v45.19: value-level fetch validation. A Savant fetch can 'succeed' at
+    the URL/column level yet return unparseable or empty values — the frame
+    then merges in and creates phantom all-NaN columns downstream (seen in the
+    column-completeness diagnostic as 0%-populated fields; same failure family
+    as the IAA field loss). Require the key column to carry at least `min_n`
+    real values before trusting the fetch."""
+    try:
+        return (df is not None and not df.empty and col in df.columns
+                and int(df[col].notna().sum()) >= min_n)
+    except Exception:
+        return False
+
+
+@st.cache_data(ttl=21600)  # 6hr — zone data updates daily
+def get_pitcher_zone_tiers(season: int = None, stats_day: str = "") -> pd.DataFrame:
+    """Pitcher % of pitches by zone tier (heart, shadow, chase, waste).
+
+    Returns DataFrame with columns:
+      player_id, pitcher_heart_pct, pitcher_shadow_pct,
+      pitcher_chase_pct, pitcher_waste_pct
+    Empty on failure — caller treats empty as "no zone data available."
+    """
+    season = season if season is not None else current_season()  # v44.62
+    # Try a few candidate URL patterns. The first that returns parseable CSV wins.
+    candidate_urls = [
+        # Custom leaderboard with zone selections
+        f"https://baseballsavant.mlb.com/leaderboard/custom"
+        f"?year={season}&type=pitcher&filter=&min=50"
+        f"&selections=player_id,player_name,heart_zone_percent,shadow_zone_percent,"
+        f"chase_zone_percent,waste_zone_percent"
+        f"&chart=false&x=heart_zone_percent&y=shadow_zone_percent&r=no&csv=true",
+        # Swing/take leaderboard
+        f"https://baseballsavant.mlb.com/leaderboard/swing-take"
+        f"?year={season}&type=pitcher&min=100&csv=true",
+    ]
+    for url in candidate_urls:
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=20)
+            r.raise_for_status()
+            if not r.text or len(r.text) < 100:
                 continue
-            away, home = game["teams"]["away"], game["teams"]["home"]
-            # Try to get pitcher hand; fallback to R
-            away_pitcher_obj = away.get("probablePitcher") or {}
-            home_pitcher_obj = home.get("probablePitcher") or {}
-            away_hand = (away_pitcher_obj.get("pitchHand") or {}).get("code", "R")
-            home_hand = (home_pitcher_obj.get("pitchHand") or {}).get("code", "R")
+            df = pd.read_csv(io.StringIO(r.text))
+            if df.empty:
+                continue
+            # Try to identify columns flexibly — Savant uses various names
+            col_map = {}
+            for c in df.columns:
+                cl = c.lower()
+                if "player_id" in cl or cl == "id":
+                    col_map["player_id"] = c
+                elif ("heart" in cl and "pct" in cl) or ("heart" in cl and "percent" in cl):
+                    col_map["heart"] = c
+                elif "shadow" in cl and ("pct" in cl or "percent" in cl):
+                    col_map["shadow"] = c
+                elif "chase" in cl and ("pct" in cl or "percent" in cl):
+                    col_map["chase"] = c
+                elif "waste" in cl and ("pct" in cl or "percent" in cl):
+                    col_map["waste"] = c
+            # Need at least player_id + heart to be useful
+            if "player_id" not in col_map or "heart" not in col_map:
+                continue
+            out = pd.DataFrame()
+            out["player_id"] = pd.to_numeric(df[col_map["player_id"]], errors="coerce").astype("Int64")
+            out["pitcher_heart_pct"] = pd.to_numeric(df[col_map["heart"]], errors="coerce")
+            for tier in ("shadow", "chase", "waste"):
+                if tier in col_map:
+                    out[f"pitcher_{tier}_pct"] = pd.to_numeric(df[col_map[tier]], errors="coerce")
+                else:
+                    out[f"pitcher_{tier}_pct"] = pd.NA
+            out = out.dropna(subset=["player_id"])
+            # v45.19: all-NaN heart% = fetch miss, not a merge (see hitter twin)
+            if not _has_real_values(out, "pitcher_heart_pct", min_n=20):
+                continue
+            return out
+        except Exception:
+            continue
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=21600)
+def get_hitter_zone_tiers(season: int = None, stats_day: str = "") -> pd.DataFrame:
+    """Hitter wOBA or run value by zone tier.
+
+    Returns DataFrame with columns:
+      player_id, hitter_heart_woba, hitter_shadow_woba,
+      hitter_chase_woba, hitter_waste_woba (or barrel% equivalents)
+    Empty on failure.
+    """
+    season = season if season is not None else current_season()  # v44.62
+    candidate_urls = [
+        f"https://baseballsavant.mlb.com/leaderboard/swing-take"
+        f"?year={season}&type=batter&min=100&csv=true",
+        f"https://baseballsavant.mlb.com/leaderboard/custom"
+        f"?year={season}&type=batter&filter=&min=50"
+        f"&selections=player_id,player_name,heart_woba,shadow_woba,chase_woba,waste_woba"
+        f"&chart=false&x=heart_woba&y=shadow_woba&r=no&csv=true",
+    ]
+    for url in candidate_urls:
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=20)
+            r.raise_for_status()
+            if not r.text or len(r.text) < 100:
+                continue
+            df = pd.read_csv(io.StringIO(r.text))
+            if df.empty:
+                continue
+            col_map = {}
+            for c in df.columns:
+                cl = c.lower()
+                if "player_id" in cl or cl == "id":
+                    col_map["player_id"] = c
+                elif "heart" in cl and ("woba" in cl or "wOBA" in c or "run_value" in cl):
+                    col_map["heart"] = c
+                elif "shadow" in cl and ("woba" in cl or "run_value" in cl):
+                    col_map["shadow"] = c
+                elif "chase" in cl and ("woba" in cl or "run_value" in cl):
+                    col_map["chase"] = c
+                elif "waste" in cl and ("woba" in cl or "run_value" in cl):
+                    col_map["waste"] = c
+            if "player_id" not in col_map or "heart" not in col_map:
+                continue
+            out = pd.DataFrame()
+            out["player_id"] = pd.to_numeric(df[col_map["player_id"]], errors="coerce").astype("Int64")
+            out["hitter_heart_woba"] = pd.to_numeric(df[col_map["heart"]], errors="coerce")
+            for tier in ("shadow", "chase", "waste"):
+                if tier in col_map:
+                    out[f"hitter_{tier}_woba"] = pd.to_numeric(df[col_map[tier]], errors="coerce")
+                else:
+                    out[f"hitter_{tier}_woba"] = pd.NA
+            out = out.dropna(subset=["player_id"])
+            # v45.19: value-level guard — headers can match while values are
+            # unparseable; all-NaN wOBA must count as a MISS, not a merge.
+            if not _has_real_values(out, "hitter_heart_woba", min_n=20):
+                continue
+            return out
+        except Exception:
+            continue
+    return pd.DataFrame()
+
+
+# ----------------------------------------------------------------------------
+# Per-player zone fetchers (v43+ — wrap bulk leaderboard fetchers)
+# ----------------------------------------------------------------------------
+# These return a single player's zone data as a dict. They wrap the bulk
+# leaderboard fetchers above which are cached, so per-player calls cost
+# nothing after the first slate load. Used by the Pitcher Lookup utility
+# so a user can scout any pitcher's zone tendencies.
+#
+# Return {} if no data found for the requested player (bulk fetch failed,
+# player not in leaderboard, etc). Callers should treat empty dict as
+# "no zone data available, fall back to other signals."
+
+def get_pitcher_zone_distribution(pitcher_id: int,
+                                    season: int = CURRENT_SEASON) -> dict:
+    """Return one pitcher's heart/shadow/chase/waste % distribution.
+
+    Wraps get_pitcher_zone_tiers (cached 6hr). Returns dict like:
+      {
+        "player_id": 696285,
+        "pitcher_heart_pct": 26.2,
+        "pitcher_shadow_pct": 41.5,
+        "pitcher_chase_pct": 24.1,
+        "pitcher_waste_pct": 8.2,
+      }
+    Or {} if not found.
+
+    Args:
+      pitcher_id: MLB player ID
+      season: which season's data (defaults to current)
+    """
+    try:
+        df = get_pitcher_zone_tiers(season=season, stats_day=_stats_day_key())
+        if df is None or df.empty:
+            return {}
+        rows = df[df["player_id"] == int(pitcher_id)]
+        if rows.empty:
+            return {}
+        return rows.iloc[0].to_dict()
+    except Exception:
+        return {}
+
+
+def get_hitter_zone_performance(hitter_id: int,
+                                  season: int = CURRENT_SEASON) -> dict:
+    """Return one hitter's wOBA by zone tier.
+
+    Wraps get_hitter_zone_tiers (cached 6hr). Returns dict like:
+      {
+        "player_id": 592450,  # Judge
+        "hitter_heart_woba": 0.488,
+        "hitter_shadow_woba": 0.310,
+        "hitter_chase_woba": 0.140,
+        "hitter_waste_woba": 0.060,
+      }
+    Or {} if not found.
+
+    Args:
+      hitter_id: MLB player ID
+      season: which season's data (defaults to current)
+    """
+    try:
+        df = get_hitter_zone_tiers(season=season, stats_day=_stats_day_key())
+        if df is None or df.empty:
+            return {}
+        rows = df[df["player_id"] == int(hitter_id)]
+        if rows.empty:
+            return {}
+        return rows.iloc[0].to_dict()
+    except Exception:
+        return {}
+
+
+def zone_fit_score(pitcher_id: int, hitter_id: int,
+                     season: int = CURRENT_SEASON) -> dict:
+    """Compute zone fit composite for one (pitcher, hitter) matchup.
+
+    Returns dict with:
+      - composite_woba: weighted hitter wOBA across the pitcher's tier distribution
+      - heart_share: pitcher's heart-of-plate %
+      - hitter_heart_woba: hitter's wOBA on heart pitches
+      - data_coverage: how much of the pitcher's distribution we have data for
+      - assessment: human-readable label
+    Or {} if data unavailable for either player.
+
+    This is the heart of zone fit: a pitcher who lives in the heart of the
+    plate (high heart_share) facing a hitter who crushes heart pitches
+    (high hitter_heart_woba) = HR risk. The composite_woba accounts for the
+    full tier distribution, not just the heart.
+    """
+    p_dist = get_pitcher_zone_distribution(pitcher_id, season)
+    h_perf = get_hitter_zone_performance(hitter_id, season)
+    if not p_dist or not h_perf:
+        return {}
+    tiers = ("heart", "shadow", "chase", "waste")
+    total_pct = 0.0
+    weighted = 0.0
+    for t in tiers:
+        p_pct = p_dist.get(f"pitcher_{t}_pct")
+        h_woba = h_perf.get(f"hitter_{t}_woba")
+        if (p_pct is None or pd.isna(p_pct)
+            or h_woba is None or pd.isna(h_woba)):
+            continue
+        try:
+            p_pct = float(p_pct); h_woba = float(h_woba)
+        except (TypeError, ValueError):
+            continue
+        weighted += p_pct * h_woba
+        total_pct += p_pct
+    if total_pct < 50.0:
+        return {}  # not enough data coverage to be meaningful
+    composite_woba = weighted / total_pct
+    # v43.1 calibration: tier-weighted composite is naturally diluted by
+    # chase/waste pitches (where every hitter performs poorly). Elite
+    # matchups produce composites ~0.350-0.370, not 0.420. League-average
+    # matchup composite is ~0.310. Recalibrated thresholds:
+    #   >= 0.370: ELITE (top ~5% of matchups — heart-pounder vs heart-crusher)
+    #   >= 0.340: STRONG (above neutral, favorable for hitter)
+    #   <= 0.260: POOR (below neutral, pitcher dominates the zones hitter struggles in)
+    if composite_woba >= 0.370:
+        assessment = "💣 elite zone fit"
+    elif composite_woba >= 0.340:
+        assessment = "🎯 strong zone fit"
+    elif composite_woba <= 0.260:
+        assessment = "🛡️ poor zone fit"
+    else:
+        assessment = "neutral"
+    return {
+        "composite_woba": round(composite_woba, 3),
+        "heart_share": round(float(p_dist.get("pitcher_heart_pct", 0)), 1),
+        "hitter_heart_woba": round(float(h_perf.get("hitter_heart_woba", 0)), 3),
+        "data_coverage_pct": round(total_pct, 1),
+        "assessment": assessment,
+    }
+
+
+# ----------------------------------------------------------------------------
+# Savant handedness-split Statcast (v43.5 — experimental, URL unverified)
+# ----------------------------------------------------------------------------
+# MLB Stats API splits give us basic handedness data (AVG, OPS, ISO, HR/PA,
+# K%, BB%). But contact-quality metrics by handedness (barrel%, hard_hit%,
+# xwOBA, avg_ev) are Statcast-only — they live in Savant.
+#
+# This is the gap that lets a hitter get an inflated grade against the side
+# they actually struggle against. Example: Jo Adell overall barrel% is ~8%,
+# but vs-LHP barrel% can be 30%+. Without these splits, power_score scores
+# him as a weak HR threat vs lefties when he's actually elite.
+#
+# DEFENSIVE PATTERN: tries several candidate URLs, returns empty DataFrame on
+# any failure. Caller treats empty as "no handedness Statcast data; fall
+# back to season-overall." Same pattern as zone tier fetchers.
+#
+# IMPORTANT: Savant URLs are NOT in the dev environment allowlist, so this
+# is NOT testable here. URL patterns must be verified in production. The
+# caption status indicator ("Savant handedness: ✅ working / ❌ unavailable")
+# tells you immediately if the fetcher connected.
+
+@st.cache_data(ttl=21600)  # 6hr — handedness splits stable day-over-day
+def get_hitter_handedness_statcast(season: int = None,
+                                     stats_day: str = "") -> pd.DataFrame:
+    """Pull hitter Statcast contact-quality metrics split by pitcher handedness.
+
+    Returns DataFrame with columns:
+      player_id,
+      vs_lhp_barrel_pct, vs_lhp_hard_hit, vs_lhp_xwoba, vs_lhp_avg_ev,
+      vs_rhp_barrel_pct, vs_rhp_hard_hit, vs_rhp_xwoba, vs_rhp_avg_ev
+    Empty on failure — caller falls back to season-overall stats.
+
+    Implementation note: Savant exposes handedness splits via the custom
+    leaderboard with a `split` parameter (or `pitch_hand` filter). We pull
+    vs-LHP and vs-RHP separately, then merge on player_id. Each side may
+    succeed or fail independently — partial data is better than none.
+    """
+    season = season if season is not None else current_season()  # v44.62
+    def _fetch_one_side(pitch_hand: str) -> pd.DataFrame:
+        """Fetch Statcast contact quality for hitters vs one pitcher hand.
+
+        pitch_hand: 'L' or 'R'
+        """
+        candidate_urls = [
+            # Custom leaderboard with pitch_hand filter and Statcast selections.
+            # Savant's custom-leaderboard endpoint accepts ?pitch_hand=L|R and
+            # returns a CSV when csv=true is appended.
+            f"https://baseballsavant.mlb.com/leaderboard/custom"
+            f"?year={season}&type=batter&filter=&min=30"
+            f"&pitch_hand={pitch_hand}"
+            f"&selections=player_id,player_name,pa,barrel_batted_rate,"
+            f"hard_hit_percent,xwoba,launch_speed"
+            f"&chart=false&x=barrel_batted_rate&y=xwoba&r=no&csv=true",
+            # Statcast leaderboard with split parameter (alternate Savant URL)
+            f"https://baseballsavant.mlb.com/leaderboard/statcast"
+            f"?type=batter&year={season}&player_type=batter"
+            f"&min_results=30&split=vs_{pitch_hand}HP&csv=true",
+            # Savant search CSV with pitcher_throws filter
+            f"https://baseballsavant.mlb.com/statcast_search/csv"
+            f"?all=true&year={season}&pitcher_throws={pitch_hand}"
+            f"&player_type=batter&min_pa=30",
+        ]
+        for url in candidate_urls:
+            try:
+                r = requests.get(url, headers=HEADERS, timeout=25)
+                r.raise_for_status()
+                if not r.text or len(r.text) < 100:
+                    continue
+                df = pd.read_csv(io.StringIO(r.text))
+                if df.empty:
+                    continue
+                # Flexible column matching — Savant column names vary
+                col_map = {}
+                for c in df.columns:
+                    cl = c.lower().replace(" ", "_")
+                    if cl in ("player_id", "playerid", "id", "mlb_id"):
+                        col_map["player_id"] = c
+                    elif "barrel" in cl and ("rate" in cl or "pct" in cl or "percent" in cl):
+                        col_map["barrel"] = c
+                    elif ("hard_hit" in cl or "hardhit" in cl) and (
+                        "rate" in cl or "pct" in cl or "percent" in cl
+                    ):
+                        col_map["hard_hit"] = c
+                    elif cl in ("xwoba", "x_woba", "estimated_woba"):
+                        col_map["xwoba"] = c
+                    elif "launch_speed" in cl or "avg_ev" in cl or "exit_velocity" in cl:
+                        col_map["avg_ev"] = c
+                    # v44.51/44.58: capture pull-air% (and overall pull% as a
+                    # separate fallback) so we can derive the REAL vs-hand
+                    # pulled_brl_pct = pull_air% × barrel% / 100. CRITICAL
+                    # (code review #4): the SEASON derivation prefers
+                    # pull_air_percent (~12-22%), NOT overall pull_percent
+                    # (~35-45%). We must match that scale or the Bayesian blend
+                    # in apply_handedness_overrides mixes two different stats and
+                    # corrupts the most-weighted Dinger input. So keep pull_air
+                    # and pull_percent in SEPARATE slots and derive only from
+                    # pull_air (falling back to overall pull only if air is absent).
+                    elif cl == "pull_air_percent" and "pull_air" not in col_map:
+                        col_map["pull_air"] = c
+                    elif cl in ("pull_percent", "pull_pct", "pulled_percent") and "pull" not in col_map:
+                        col_map["pull"] = c
+                    elif cl in ("iso", "isolated_power") and "iso" not in col_map:
+                        col_map["iso"] = c
+                # Need at least player_id + barrel to be useful
+                if "player_id" not in col_map or "barrel" not in col_map:
+                    continue
+                out = pd.DataFrame()
+                out["player_id"] = pd.to_numeric(
+                    df[col_map["player_id"]], errors="coerce"
+                ).astype("Int64")
+                out["barrel_pct"] = pd.to_numeric(df[col_map["barrel"]], errors="coerce")
+                for stat in ("hard_hit", "xwoba", "avg_ev", "pull_air", "pull", "iso"):
+                    if stat in col_map:
+                        out[stat] = pd.to_numeric(df[col_map[stat]], errors="coerce")
+                    else:
+                        out[stat] = pd.NA
+                # v44.58: derive vs-hand pulled_brl_pct from pull_air ONLY
+                # (matches the season formula's scale). If pull_air is absent for
+                # this endpoint, we do NOT derive from overall pull_percent —
+                # that would be a ~2x scale mismatch — leaving pulled_brl_pct
+                # NaN so the override falls back to its (scale-safe) barrel-ratio
+                # proxy instead of blending mismatched scales.
+                if "pull_air" in col_map:
+                    out["pulled_brl_pct"] = (
+                        out["pull_air"] * out["barrel_pct"] / 100.0
+                    ).round(2)
+                return out.dropna(subset=["player_id"])
+            except Exception:
+                continue
+        return pd.DataFrame()
+
+    # Fetch both sides; either may fail independently
+    df_l = _fetch_one_side("L")
+    df_r = _fetch_one_side("R")
+
+    # v45.19: value-level guard — a side that fetched headers but parsed to
+    # all-NaN would merge phantom vs_lhp_/vs_rhp_ columns (0%-populated) into
+    # hitter_stats. Treat an all-NaN key column as a fetch miss for that side.
+    if not df_l.empty and not _has_real_values(
+            df_l, "barrel_pct" if "barrel_pct" in df_l.columns else "avg_ev", min_n=20):
+        df_l = pd.DataFrame()
+    if not df_r.empty and not _has_real_values(
+            df_r, "barrel_pct" if "barrel_pct" in df_r.columns else "avg_ev", min_n=20):
+        df_r = pd.DataFrame()
+
+    if df_l.empty and df_r.empty:
+        return pd.DataFrame()
+
+    # Rename columns with vs_lhp_ / vs_rhp_ prefix
+    if not df_l.empty:
+        df_l = df_l.rename(columns={
+            "barrel_pct": "vs_lhp_barrel_pct",
+            "hard_hit": "vs_lhp_hard_hit",
+            "xwoba": "vs_lhp_xwoba",
+            "avg_ev": "vs_lhp_avg_ev",
+            "pull": "vs_lhp_pull_pct",
+            "pull_air": "vs_lhp_pull_air_pct",
+            "iso": "vs_lhp_iso",
+            "pulled_brl_pct": "vs_lhp_pulled_brl_pct",
+        })
+    if not df_r.empty:
+        df_r = df_r.rename(columns={
+            "barrel_pct": "vs_rhp_barrel_pct",
+            "hard_hit": "vs_rhp_hard_hit",
+            "xwoba": "vs_rhp_xwoba",
+            "avg_ev": "vs_rhp_avg_ev",
+            "pull": "vs_rhp_pull_pct",
+            "pull_air": "vs_rhp_pull_air_pct",
+            "iso": "vs_rhp_iso",
+            "pulled_brl_pct": "vs_rhp_pulled_brl_pct",
+        })
+
+    # Outer merge on player_id — keep all hitters that appeared on either side
+    if df_l.empty:
+        return df_r
+    if df_r.empty:
+        return df_l
+    return df_l.merge(df_r, on="player_id", how="outer")
+
+
+def apply_handedness_overrides(matchup_df: pd.DataFrame,
+                                 p_throws: str | None,
+                                 min_split_pa: int = 30,
+                                 shrinkage_pa: int = 70) -> pd.DataFrame:
+    """Per-game: blend season-overall barrel/hard_hit/xwoba/avg_ev/iso
+    with handedness-specific values, weighted by sample size.
+
+    v43.64 (reviewer doc fix #10) — IMPORTANT coverage caveat:
+    This function CAN blend barrel/hard_hit/xwoba/avg_ev/iso BUT only when
+    the corresponding `vs_lhp_*` / `vs_rhp_*` Statcast columns are actually
+    present. Those columns only exist if `get_hitter_handedness_statcast`
+    succeeded — and that fetcher's Savant URLs are unverified and often
+    return empty. In the common case the Savant handedness fetch comes
+    back empty, this function only blends `iso` (from the MLB Stats API
+    split path, which IS reliable). So "handedness blend" is effectively
+    "ISO-only blend" most of the time. The `_hand_statcast_status` caption
+    in app.py surfaces whether Statcast actually returned. Tune
+    expectations accordingly — Pipeline Health's "handedness coverage"
+    line shows what's actually populated.
+
+    v43.43 (reviewer-validated): the original v43.18 implementation did a
+    HARD REPLACE of season values with handedness values when split_pa >=
+    min_split_pa=30. That let a hitter with 35 PA vs LHP and a flukey ISO
+    fully drive their grade. Reviewer caught this: "tiny-sample splits
+    driving grades — split_confidence warns but doesn't stop the override
+    from affecting the score."
+
+    The fix is a Bayesian shrinkage blend:
+      blended = (hand_pa × hand_value + shrinkage_pa × season_value)
+                / (hand_pa + shrinkage_pa)
+
+    With shrinkage_pa=70 (default, v44.47 — lowered from 100 so platoon-correct
+    data drives more of the blend):
+      30 PA hand sample  → 30% weight to handedness, 70% to season-overall
+      70 PA              → 50% / 50%
+      100 PA             → 59% / 41%
+      200 PA             → 74% / 26%
+      300+ PA            → 81%+ / 19%-
+
+    This means flukey small samples can shift the grade but can't dominate
+    it. Established split hitters (200+ PA) still get most of the override
+    benefit. No hard cutoff — the blend gracefully scales.
+
+    The min_split_pa=30 floor still applies: below 30 PA, no blend at all
+    (just season-overall).
+
+    Returns modified matchup_df. Original column values are not preserved
+    (they remain in vs_lhp_* / vs_rhp_* for reference). Switch hitters: the
+    vs_lhp/vs_rhp splits naturally reflect which side they batted (splits
+    accumulate based on pitcher faced), so the blend works the same way.
+    """
+    if matchup_df is None or matchup_df.empty:
+        return matchup_df
+    if not p_throws or p_throws not in ("L", "R"):
+        return matchup_df
+
+    side = "lhp" if p_throws == "L" else "rhp"
+    pa_col = f"vs_{side}_pa"
+    if pa_col not in matchup_df.columns:
+        return matchup_df
+
+    df = matchup_df.copy()
+    pa_vals = pd.to_numeric(df[pa_col], errors="coerce")
+    # Hard floor: below min_split_pa, ignore handedness entirely
+    sufficient_mask = pa_vals >= min_split_pa
+
+    # Bayesian blend each stat with shrinkage toward season-overall
+    overrides = [
+        ("barrel_pct",  f"vs_{side}_barrel_pct"),
+        ("hard_hit",    f"vs_{side}_hard_hit"),
+        ("xwoba",       f"vs_{side}_xwoba"),
+        ("avg_ev",      f"vs_{side}_avg_ev"),
+        ("iso",         f"vs_{side}_iso"),
+    ]
+    for season_col, hand_col in overrides:
+        if season_col in df.columns and hand_col in df.columns:
+            season_vals = pd.to_numeric(df[season_col], errors="coerce")
+            hand_vals = pd.to_numeric(df[hand_col], errors="coerce")
+            # Apply blend only where: sufficient PA AND both values valid
+            blend_mask = sufficient_mask & hand_vals.notna() & season_vals.notna()
+            if blend_mask.any():
+                # weight_hand = hand_pa / (hand_pa + shrinkage_pa)
+                hand_pa = pa_vals[blend_mask]
+                w_hand = hand_pa / (hand_pa + shrinkage_pa)
+                w_season = 1 - w_hand
+                blended = (
+                    hand_vals[blend_mask] * w_hand
+                    + season_vals[blend_mask] * w_season
+                )
+                df.loc[blend_mask, season_col] = blended
+
+    # v44.50/44.51 (user: "some players rank high vs a hand they don't homer
+    # against"). ROOT CAUSE: pulled_brl_pct is our most reliable HR signal
+    # (Section G reliab 2.85, Dinger weight 2.0) but historically had no
+    # vs-hand split, so it stayed season-overall regardless of platoon.
+    # v44.51: we now FETCH the real vs-hand pulled_brl_pct (derived from pull%
+    # × barrel% by hand in the split fetch). Use it directly with the same
+    # Bayesian blend as the other stats. Only if that real split is missing do
+    # we fall back to the v44.50 proxy (scale by barrel_pct's movement).
+    _real_pbrl_col = f"vs_{side}_pulled_brl_pct"
+    if ("pulled_brl_pct" in df.columns and _real_pbrl_col in df.columns
+            and pd.to_numeric(df[_real_pbrl_col], errors="coerce").notna().any()):
+        _season_pbrl = pd.to_numeric(df["pulled_brl_pct"], errors="coerce")
+        _hand_pbrl = pd.to_numeric(df[_real_pbrl_col], errors="coerce")
+        _pbrl_mask = sufficient_mask & _hand_pbrl.notna() & _season_pbrl.notna()
+        if _pbrl_mask.any():
+            _hp = pa_vals[_pbrl_mask]
+            _wh = _hp / (_hp + shrinkage_pa)
+            df.loc[_pbrl_mask, "pulled_brl_pct"] = (
+                _hand_pbrl[_pbrl_mask] * _wh
+                + _season_pbrl[_pbrl_mask] * (1 - _wh)
+            )
+    else:
+        # Fallback proxy (v44.50): scale pulled_brl_pct by how much barrel_pct
+        # moved vs this hand, capped ±25%. Used only when the real split is
+        # unavailable for a hitter.
+        try:
+            if "pulled_brl_pct" in df.columns and "barrel_pct" in matchup_df.columns:
+                _orig_brl = pd.to_numeric(matchup_df["barrel_pct"], errors="coerce")
+                _new_brl = pd.to_numeric(df["barrel_pct"], errors="coerce")
+                _pbrl = pd.to_numeric(df["pulled_brl_pct"], errors="coerce")
+                _ratio = (_new_brl / _orig_brl)
+                _ratio = _ratio.where(_ratio.abs() != float("inf"))
+                _adj_mask = (sufficient_mask & _ratio.notna() & _pbrl.notna()
+                             & (_orig_brl > 0))
+                _ratio_capped = _ratio.clip(0.75, 1.25)
+                df.loc[_adj_mask, "pulled_brl_pct"] = (
+                    _pbrl[_adj_mask] * _ratio_capped[_adj_mask]
+                )
+        except Exception:
+            pass
+    return df
+
+
+# ----------------------------------------------------------------------------
+# Batter vs Pitcher (BvP) history — v43.14
+# ----------------------------------------------------------------------------
+# IMPORTANT — honest analytics context: published research (FanGraphs,
+# Baseball Prospectus, etc.) consistently finds that career BvP has very
+# weak predictive power once you control for handedness, pitcher skill,
+# and park. The sample sizes are tiny (typical max ~30-50 PA across
+# multiple years, often <15 PA) and the noise dominates any signal.
+#
+# That said, BvP IS contextually interesting and worth surfacing:
+#   - Tiebreaker between similar grades
+#   - Display value (most user-facing tools show it)
+#   - Strong tails (4-for-8 with 3 HR) DO have weak predictive lift
+#
+# Our approach:
+#   1. Fetch via MLB Stats API's vsPlayer split endpoint
+#   2. Display raw counts (PA, HR, AB, hits) — let the user judge
+#   3. Light-weight scoring incorporation:
+#      - Only fires at PA >= 20 (below = treat as no information)
+#      - Hard-capped at ±5 bonus points to pick_score
+#      - Never overrides the model's underlying signal
+#
+# Cache duration: 12 hours. BvP changes only when these two specific players
+# face off, which happens at most once per series.
+
+@st.cache_data(ttl=43200)  # 12hr
+def get_bvp_for_matchup(batter_id: int, pitcher_id: int) -> dict:
+    """Fetch career batter-vs-pitcher stats from MLB Stats API.
+
+    Returns dict with:
+      pa, ab, hr, h, bb, k, avg, slg, ops, hr_per_pa
+    or {} on any failure / no history.
+
+    Endpoint: /api/v1/people/{batter_id}/stats?stats=vsPlayer&opposingPlayerId={pitcher_id}&group=hitting
+    """
+    if (batter_id is None or pitcher_id is None
+            or pd.isna(batter_id) or pd.isna(pitcher_id)):
+        return {}
+    try:
+        bid = int(batter_id)
+        pid = int(pitcher_id)
+    except (TypeError, ValueError):
+        return {}
+    if bid <= 0 or pid <= 0:
+        return {}
+
+    url = (
+        f"https://statsapi.mlb.com/api/v1/people/{bid}/stats"
+        f"?stats=vsPlayer&opposingPlayerId={pid}&group=hitting"
+    )
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=12)
+        if r.status_code != 200:
+            return {}
+        data = r.json()
+        # Aggregate across all season splits returned (career = sum)
+        agg_pa = 0; agg_ab = 0; agg_hr = 0; agg_h = 0
+        agg_bb = 0; agg_k = 0; agg_2b = 0; agg_3b = 0
+        for stat_group in data.get("stats", []):
+            for split in stat_group.get("splits", []):
+                stat = split.get("stat", {})
+
+                def _to_int(v):
+                    if v is None: return 0
+                    try: return int(v)
+                    except (TypeError, ValueError):
+                        try: return int(float(v))
+                        except (TypeError, ValueError): return 0
+
+                agg_pa += _to_int(stat.get("plateAppearances") or stat.get("pa"))
+                agg_ab += _to_int(stat.get("atBats") or stat.get("ab"))
+                agg_hr += _to_int(stat.get("homeRuns") or stat.get("hr"))
+                agg_h  += _to_int(stat.get("hits") or stat.get("h"))
+                agg_bb += _to_int(stat.get("baseOnBalls") or stat.get("bb"))
+                agg_k  += _to_int(stat.get("strikeOuts") or stat.get("so"))
+                agg_2b += _to_int(stat.get("doubles") or stat.get("2b"))
+                agg_3b += _to_int(stat.get("triples") or stat.get("3b"))
+
+        if agg_pa == 0 and agg_ab == 0:
+            return {}
+
+        denom_pa = agg_pa if agg_pa > 0 else agg_ab
+        denom_ab = agg_ab if agg_ab > 0 else agg_pa
+
+        # Compute derived stats
+        # v43.18 (reviewer-validated defensive): if MLB Stats API ever
+        # returns inconsistent data (agg_h < 2b+3b+hr), singles goes negative
+        # and SLG becomes nonsense. Clamp at zero.
+        singles = max(0, agg_h - agg_2b - agg_3b - agg_hr)
+        total_bases = singles + 2 * agg_2b + 3 * agg_3b + 4 * agg_hr
+        out = {
+            "bvp_pa": agg_pa or agg_ab,
+            "bvp_ab": agg_ab,
+            "bvp_hr": agg_hr,
+            "bvp_h": agg_h,
+            "bvp_bb": agg_bb,
+            "bvp_k": agg_k,
+            "bvp_avg": round(agg_h / denom_ab, 3) if denom_ab > 0 else None,
+            "bvp_slg": round(total_bases / denom_ab, 3) if denom_ab > 0 else None,
+            "bvp_hr_per_pa": round(agg_hr / denom_pa * 100, 2) if denom_pa > 0 else None,
+        }
+        return out
+    except Exception:
+        return {}
+
+
+def bvp_score_adjustment(bvp_dict: dict, min_pa: int = 20) -> tuple[float, str]:
+    """Convert BvP history into a small pick_score adjustment.
+
+    Returns (adjustment_points, descriptive_flag).
+
+    Adjustment is capped at ±5 points (intentionally small — BvP has weak
+    predictive power per the research, so we treat it as a tiebreaker, not
+    a driver). Returns (0, "") if sample is too small (<min_pa) or no data.
+
+    Flag examples:
+      "🎯 BvP +5 (8/15, 3 HR)"  — strong positive history
+      "⚠️ BvP -3 (1/18, 0 HR)"  — weak history
+      ""                         — insufficient sample or no data
+    """
+    if not bvp_dict:
+        return (0.0, "")
+    pa = bvp_dict.get("bvp_pa") or 0
+    if pa < min_pa:
+        return (0.0, "")
+
+    hr = bvp_dict.get("bvp_hr") or 0
+    hr_rate = bvp_dict.get("bvp_hr_per_pa")
+    h = bvp_dict.get("bvp_h") or 0
+    ab = bvp_dict.get("bvp_ab") or 0
+    # v43.81 cleanup: `slg` and `avg` were assigned here but never used.
+    # The scoring comment mentions "SLG/AVG" but the actual code only reads
+    # hr_rate + h/ab counts. If we want to bring SLG/AVG into scoring later,
+    # we'll re-add these.
+
+    # Score based on HR rate vs league average (~3% per PA)
+    # AND on overall production (SLG/AVG)  <— aspirational, not implemented yet
+    points = 0.0
+    if hr_rate is not None:
+        # +1 pt per 1% above league avg, capped at +5
+        # -1 pt per 1.5% below league avg, capped at -3
+        delta = float(hr_rate) - 3.0
+        if delta > 0:
+            points = min(5.0, delta * 1.0)
+        else:
+            points = max(-3.0, delta * 0.67)
+
+    # Build descriptive flag
+    if hr_rate is None:
+        return (0.0, "")
+    if points >= 3.0:
+        emoji = "💣"
+    elif points >= 1.5:
+        emoji = "🎯"
+    elif points <= -2.0:
+        emoji = "⚠️"
+    elif points <= -1.0:
+        emoji = "📉"
+    else:
+        emoji = "📊"
+    sign = "+" if points >= 0 else ""
+    flag = f"{emoji} BvP {sign}{points:.1f} ({h}/{ab}, {hr} HR in {pa} PA)"
+    return (round(points, 1), flag)
+# ----------------------------------------------------------------------------
+# v43.50 (reviewer-validated removal): Batter-park history section removed.
+# The v43.26 feature used stats=byVenue which MLB Stats API rejects with
+# HTTP 400 ('Invalid Request with value: byVenue'). v43.42 retry was equally
+# broken. Feature contributed ~0.04% to HR Score even when working — not
+# worth the complexity of switching to game-log-based replacement. If we
+# ever want this back, the right approach is per-batter game log filtered
+# by venue.id, with diagnostics from day one.
+# ----------------------------------------------------------------------------
+
+
+
+# ----------------------------------------------------------------------------
+# Bat tracking / Blast % fetcher — v43.17 (OPT-IN)
+# ----------------------------------------------------------------------------
+# Statcast added bat tracking in mid-2024. The metric the user requested
+# ("Blast %") is a Statcast-defined event: a swing that is both
+# (a) squared up (contact quality) AND
+# (b) fast (bat speed ≥75 mph).
+# It captures roughly the same thing as barrel% but on the SWING level
+# rather than the BBE level, so it covers all swings not just contact.
+# This is real and predictive — June 2025 Statcast research showed
+# blast rate has higher year-over-year stability than barrel rate.
+#
+# Implementation notes (per user's "opt-in" requirement):
+#   - Defaults to DISABLED. User toggles in sidebar.
+#   - Caches 24hr (bat tracking changes slowly week-to-week).
+#   - Field names tried as a fallback chain (Savant has changed them
+#     between 2024 beta and 2025 production). Status reported in caption.
+#   - On any failure / empty result, the fetcher returns empty DataFrame
+#     and the status caption shows the failure. No silent zero-data.
+#   - If enabled and successful, app.py blends `blast_pct` into hr_form.
+#     If enabled but fetcher returned empty, hr_form falls back to v43.16
+#     weights (no blast component). No silent degradation.
+
+# v43.42 diagnostic: when get_bat_tracking can't find an
+# ideal_attack_angle column under any candidate name, it stores Savant's
+# ACTUAL response columns here so we can verify the field name. The app
+# surfaces this in an expander when IAA is missing for everyone.
+_LAST_BAT_TRACKING_COLS: list = []
+
+# v43.69 (production-debug): track what happened in the avg_dist / barrel_count
+# fallback fetch. Each entry: {"url": str, "status": int|str, "n_rows": int,
+# "cols": [...truncated], "dist_col": str|None, "brl_col": str|None,
+# "id_col": str|None, "dist_merged": int, "brl_merged": int}.
+# Surfaced via last_distance_diag() so app.py can show in Pipeline Health.
+_LAST_DISTANCE_DIAG: list = []
+
+def last_distance_diag() -> list:
+    """Returns the most recent avg_dist/barrel_count fallback fetch attempts.
+
+    Each entry is a dict describing one URL attempt. Empty list means the
+    fallback didn't run (because data was already present from primary fetch).
+    """
+    try:
+        from_state = st.session_state.get("_last_distance_diag")
+        if from_state:
+            return list(from_state)
+    except Exception:
+        pass
+    return list(_LAST_DISTANCE_DIAG)
+
+def last_bat_tracking_columns() -> list:
+    """Returns the most recent Savant bat-tracking response's column names.
+
+    v43.62 (reviewer-validated fix): prefers st.session_state over the
+    module global. The global was set inside `get_bat_tracking` which is
+    `@st.cache_data` — on cache hit the function body doesn't run, so the
+    global stayed stale. App.py now stashes the returned 3rd tuple element
+    into session_state on EVERY call (cache hit or miss), so this reader
+    always sees the most recent fetch.
+
+    Empty when IAA was found, fetcher hasn't run, or session_state unavailable.
+    """
+    try:
+        # Prefer session_state (set by app.py from get_bat_tracking's
+        # 3rd tuple element — survives the @st.cache_data wrapper)
+        cols = st.session_state.get("_last_bat_tracking_cols")
+        if cols:
+            return list(cols)
+    except Exception:
+        pass
+    # Fall back to module global (legacy path / non-Streamlit callers)
+    return list(_LAST_BAT_TRACKING_COLS)
+
+@st.cache_data(ttl=86400)  # 24hr — bat tracking is a slow-moving stat
+def get_bat_tracking(season: int | None = None, stats_day: str | None = None) -> tuple[pd.DataFrame, str, list]:
+    """Fetch Statcast bat tracking leaderboard.
+
+    Returns (df, status_message, savant_columns):
+      - df: the bat tracking dataframe (empty on failure)
+      - status_message: describes what happened (used by app caption)
+      - savant_columns: list of column names Savant actually returned
+                        (used by the IAA diagnostic to surface field-name drift)
+
+    Possible status messages:
+      - "✅ N hitters" — success, df has rows
+      - "❌ no rows returned" — endpoint responded but df was empty
+      - "❌ no blast column" — endpoint returned data but expected field
+                                names weren't there (Savant schema drift)
+      - "❌ fetch error: ..." — HTTP / parse error
+
+    v43.62 (reviewer-validated):
+      • Fix #1.2: returns savant_columns as part of the tuple. Previously
+        the function wrote to a module-level `_LAST_BAT_TRACKING_COLS`
+        global, but `@st.cache_data` skips the function body on cache hit
+        so the global stays stale. The IAA diagnostic in app.py read that
+        global and showed empty/old data after the first slate of the day.
+        Returning the column list as part of the cached tuple means it
+        survives caching — same data the diagnostic needs, but reliable.
+      • Fix #1.6: `season: int = 2025` default removed. Now defaults to
+        current year via None sentinel — wouldn't go stale next year.
+    """
+    # v43.62: resolve default season at call time (was a stale hardcoded 2025)
+    if season is None:
+        from datetime import date as _date
+        season = _date.today().year
+
+    # v43.59: declare global at function entry so all assignment sites
+    # downstream (both the v43.57 dropna-failure path and the original
+    # v43.42 iaa-missing path) can write without re-declaring.
+    # v43.62: still maintained for backward compat with last_bat_tracking_columns(),
+    # but the canonical source of truth is now the 3rd tuple element.
+    global _LAST_BAT_TRACKING_COLS
+
+    # Field name variants — try each, take whichever returns data
+    # v43.58 (production-validated): updated based on actual Savant column
+    # list observed June 2026: id, name, swings_competitive,
+    # percent_swings_competitive, contact, avg_bat_speed, hard_swing_rate,
+    # squared_up_per_bat_contact, squared_up_per_swing, blast_per_bat_contact,
+    # blast_per_swing, swing_length, swords, batter_run_value, whiffs,
+    # whiff_per_swing, batted_ball_events, batted_ball_event_per_swing.
+    # Notably: Savant uses "hard_swing_rate" (not fast_swing*),
+    # "blast_per_swing" / "blast_per_bat_contact" (not blast_rate*), and
+    # has NO ideal-attack-angle column at all in this endpoint.
+    #
+    # v43.64 (reviewer fix #9 — calibration pin): per-swing and per-contact
+    # have DIFFERENT denominators. Same hitter looks ~20-30% better in one
+    # metric than the other. HR Criteria #4's `blast_pct ≥ 5` threshold was
+    # calibrated against per-SWING. If we silently switch to per-contact
+    # when per-swing is empty, criterion #4 flips meaning. Pin to per-swing
+    # candidates only; if Savant drops per-swing, we'll see it in the
+    # bat-tracking status and can update deliberately, not silently.
+    # Removed from candidates: "blast_per_bat_contact", "blasts_per_bbe".
+    blast_candidates = ["blast_rate", "blasts_per_swing", "blast_percent",
+                          "blast_per_swing"]
+    bat_speed_candidates = ["avg_bat_speed", "bat_speed_avg", "swing_speed",
+                              "bat_speed"]
+    fast_swing_candidates = ["fast_swing_rate", "fast_swing_percent",
+                              "hard_swing_rate"]
+    # Same per-swing vs per-contact concern applies; pin to per-swing.
+    squared_up_candidates = ["squared_up_rate", "squared_up_per_swing",
+                               "squared_up_percent"]
+    # v43.36 (user-requested): Ideal Attack Angle — Statcast bat-tracking
+    # metric: % of competitive swings where attack angle is 5-20°. This is
+    # the "HR launch zone" swing path. League avg ~50-55%, elite ~65%+.
+    # v43.42: expanded candidate list — none of the original 6 names
+    # matched what Savant returns. Adding common Statcast bat-tracking
+    # field naming patterns. If STILL none match, log what columns Savant
+    # actually returned so we can fix it on next ship.
+    ideal_aa_candidates = [
+        # Original candidates (v43.36)
+        "attack_angle_in_range_pct", "ideal_attack_angle_pct",
+        "attack_angle_ideal", "ideal_swing_pct", "ideal_attack_rate",
+        "attack_angle_in_zone_pct",
+        # v43.42 additions — common Statcast bat-tracking patterns
+        "attack_angle_in_ideal_range_pct", "attack_angle_ideal_pct",
+        "ideal_attack_angle_rate", "competitive_swings_in_attack_range_pct",
+        "attack_angle_ideal_range", "attack_angle_5_20_pct",
+        "swings_in_attack_range_rate", "ideal_attack_swing_rate",
+    ]
+
+    # Build a selections string that includes ALL candidates — Savant
+    # should return whichever ones it has, ignore the rest.
+    all_fields = (["player_id", "player_name"]
+                  + blast_candidates + bat_speed_candidates
+                  + fast_swing_candidates + squared_up_candidates
+                  + ideal_aa_candidates)
+    selections = ",".join(all_fields)
+
+    candidate_urls = [
+        # Primary: custom leaderboard with bat-tracking selections.
+        # Same endpoint that already works for hard_hit/barrel_pct etc.
+        # v44.89: min=10 (was min=q). "q" = fully qualified (~3.1 PA/team-game),
+        # which excludes part-time and recently-promoted starters — dropping
+        # blast_pct real-coverage on the night's starters to ~60% (rest median-
+        # imputed). min=10 widens the net to any hitter with 10+ PA of bat-
+        # tracking, capturing more real starters while keeping the sample big
+        # enough to be meaningful. Cuts imputation in Dinger Score + HR Crit #4.
+        f"https://baseballsavant.mlb.com/leaderboard/custom"
+        f"?year={season}&type=batter&filter=&min=10"
+        f"&selections={selections}"
+        f"&chart=false&x=player_name&y=player_name&r=no&csv=true",
+        # Fallback: dedicated bat-tracking leaderboard URL
+        f"https://baseballsavant.mlb.com/leaderboard/bat-tracking"
+        f"?attackZone=&batSide=&season={season}&team=&min=10"
+        f"&sortColumn={blast_candidates[0]}&sortDirection=desc&csv=true",
+        # v44.89 safety net: the ORIGINAL min=q URLs, kept as final fallbacks.
+        # If min=10 ever errors or returns an unexpected schema, we still get
+        # the known-good qualified data (60% coverage beats a broken fetch).
+        f"https://baseballsavant.mlb.com/leaderboard/custom"
+        f"?year={season}&type=batter&filter=&min=q"
+        f"&selections={selections}"
+        f"&chart=false&x=player_name&y=player_name&r=no&csv=true",
+        f"https://baseballsavant.mlb.com/leaderboard/bat-tracking"
+        f"?attackZone=&batSide=&season={season}&team=&min=q"
+        f"&sortColumn={blast_candidates[0]}&sortDirection=desc&csv=true",
+    ]
+
+    for _url_idx, url in enumerate(candidate_urls):
+        # v44.90: extract the min= value from this URL for the diagnostic, so
+        # the status message reveals which qualifier actually succeeded (min=10
+        # vs the min=q fallback). Tells us if coverage is capped by the filter
+        # or by Savant's data availability.
+        _mm = re.search(r'min=([^&]+)', url)
+        _url_min = _mm.group(1) if _mm else "?"
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=25)
+            if r.status_code != 200:
+                continue
+            if not r.text or len(r.text) < 100:
+                continue
+            df = pd.read_csv(io.StringIO(r.text))
+            if df.empty:
+                continue
+
+            # v43.59 (production-validated): the previous "first candidate
+            # that's in df.columns" pattern failed because Savant returns
+            # EVERY column we request in selections=..., regardless of
+            # whether the column actually has data populated. In June 2026:
+            # `blast_rate` was returned but all 157 values were NaN; the
+            # actually-populated column was a different blast variant.
+            # Switch to "first candidate that exists AND has non-NaN data".
+            def _pick_populated_col(candidates, df):
+                """Return the first candidate that has actual data.
+                Falls back to first existing column even if all-NaN (still
+                better than None for downstream diagnostics).
+                """
+                for c in candidates:
+                    if c in df.columns:
+                        try:
+                            if df[c].notna().any():
+                                return c
+                        except Exception:
+                            continue
+                # Second pass: exists but all NaN — return for diagnostic visibility
+                for c in candidates:
+                    if c in df.columns:
+                        return c
+                return None
+
+            # Find which blast field came back AND has data
+            blast_col = _pick_populated_col(blast_candidates, df)
+            if blast_col is None:
+                # Fuzzy match: any column with "blast" in name
+                _fuzzy = [c for c in df.columns if "blast" in c.lower()]
+                blast_col = _pick_populated_col(_fuzzy, df)
+            if blast_col is None:
+                continue  # no blast column at all, try next URL
+            # If we got the column but it's all-NaN, treat as missing data
+            # and try the NEXT URL (in case another URL returns populated data).
+            if not df[blast_col].notna().any():
+                # blast column exists but empty — this URL is a dud
+                _LAST_BAT_TRACKING_COLS = list(df.columns)
+                continue
+
+            # Find supporting columns (same data-density logic)
+            bs_col = _pick_populated_col(bat_speed_candidates, df)
+            if bs_col is None:
+                _fuzzy = [c for c in df.columns
+                          if "bat_speed" in c.lower() or "swing_speed" in c.lower()]
+                bs_col = _pick_populated_col(_fuzzy, df)
+            fs_col = _pick_populated_col(fast_swing_candidates, df)
+            if fs_col is None:
+                _fuzzy = [c for c in df.columns
+                          if "fast_swing" in c.lower() or "hard_swing" in c.lower()]
+                fs_col = _pick_populated_col(_fuzzy, df)
+            sq_col = _pick_populated_col(squared_up_candidates, df)
+            if sq_col is None:
+                _fuzzy = [c for c in df.columns if "squared_up" in c.lower()]
+                sq_col = _pick_populated_col(_fuzzy, df)
+            # v43.36: ideal_attack_angle — try exact candidates, then fall
+            # back to fuzzy match on "attack" + "angle" in column name.
+            iaa_col = _pick_populated_col(ideal_aa_candidates, df)
+            if iaa_col is None:
+                _fuzzy = [c for c in df.columns
+                          if ("attack" in c.lower() and "angle" in c.lower())
+                          or "ideal_attack" in c.lower()]
+                iaa_col = _pick_populated_col(_fuzzy, df)
+
+            # v43.42: when IAA isn't found, log what Savant ACTUALLY returned
+            # to a module-level diagnostic so we can verify the field name
+            # offline. Without this we keep guessing field names blindly.
+            # v43.59: `global _LAST_BAT_TRACKING_COLS` moved to function entry.
+            if not iaa_col:
+                _LAST_BAT_TRACKING_COLS = list(df.columns)
+
+            # v43.57: hardier player_id detection — Savant may use a
+            # different column name (mlbam_id, id, player, etc) depending on
+            # endpoint. Previously we read df.get("player_id") which
+            # returned None silently when the field had any other name,
+            # making every output row's player_id NaN → dropna killed
+            # everything → "no rows after filtering" status.
+            pid_candidates = ["player_id", "mlbam_id", "id", "playerid",
+                              "MLBAMID", "key_mlbam", "Player ID"]
+            pid_col = next((c for c in pid_candidates if c in df.columns),
+                           # Fuzzy match: any column with "id" or "mlbam" in lower
+                           next((c for c in df.columns
+                                 if "mlbam" in c.lower()
+                                 or (c.lower().endswith("_id") and "team" not in c.lower())
+                                 or c.lower() == "id"), None))
+
+            # Build output frame with normalized column names
+            out = pd.DataFrame()
+            if pid_col:
+                out["player_id"] = pd.to_numeric(df[pid_col], errors="coerce")
+            else:
+                out["player_id"] = pd.Series(dtype="float64")  # all NaN
+            # v43.58 (critical fix): the previous `df.get("player_name") or
+            # df.get("name") or df.get("Name")` chain raised ValueError
+            # ("truth value of Series is ambiguous") when player_name was
+            # missing but name was present. The `or` operator evaluates
+            # bool() on each Series, which pandas refuses for len > 1.
+            # ValueError got caught by outer except → continue → next URL
+            # → same bug → "all endpoints failed". Use explicit None checks.
+            for _name_col in ("player_name", "name", "Name"):
+                if _name_col in df.columns:
+                    out["player_name"] = df[_name_col]
+                    break
+            else:
+                out["player_name"] = pd.Series(dtype="object")
+            # v43.65 (reviewer-validated CRITICAL fix #9): Savant returns
+            # `blast_per_swing` as a 0-1 DECIMAL (e.g. 0.05 means "5% of
+            # swings are blasts"). The rest of the codebase uses 0-100
+            # PERCENTAGE convention (barrel_pct, hard_hit, pull_pct all 0-100).
+            # The mismatch made HR Criteria #4's threshold (5.0) structurally
+            # unreachable — production export showed `hr_crit_iaa` = 0 for
+            # all 532 hitters, max criteria_met = 3/4 ever. Multiply by 100
+            # at the fetcher to restore convention consistency. App.py's
+            # median imputation block is scale-agnostic (works on either
+            # scale); only the threshold check in add_hr_criteria was
+            # scale-sensitive, and that now sees 0-100 values matching the
+            # documented ≥5 threshold.
+            _raw_blast = pd.to_numeric(df[blast_col], errors="coerce")
+            # Defensive: if Savant ever switches to percent (e.g. 5.0 not
+            # 0.05), don't double-multiply. Sniff scale by median —
+            # decimal-scale blasts have median ~0.03-0.06; percent-scale
+            # would have median ~3-6. Threshold at 1.0 cleanly separates.
+            try:
+                _med = float(_raw_blast.dropna().median())
+                if pd.notna(_med) and _med < 1.0:
+                    out["blast_pct"] = (_raw_blast * 100).round(2)
+                else:
+                    out["blast_pct"] = _raw_blast.round(2)
+            except Exception:
+                # If sniff fails, default to multiply-by-100 (the empirically
+                # observed Savant behavior as of June 2026)
+                out["blast_pct"] = (_raw_blast * 100).round(2)
+            if bs_col:
+                out["bat_speed"] = pd.to_numeric(df[bs_col], errors="coerce")
+            # v43.65: same scale normalization as blast_pct (Savant returns
+            # 0-1 decimal for all per-swing/per-contact rates; codebase
+            # convention is 0-100).
+            # v43.82 (reviewer-noted): _to_percent_scale below captures `df`
+            # from the enclosing scope. Safe because it's called immediately
+            # below in the same function scope, not in a deferred context.
+            def _to_percent_scale(col_name, _df=df):
+                """Sniff scale and multiply by 100 if it's a 0-1 decimal."""
+                series = pd.to_numeric(_df[col_name], errors="coerce")
+                try:
+                    _med = float(series.dropna().median())
+                    if pd.notna(_med) and _med < 1.0:
+                        return (series * 100).round(2)
+                except Exception:
+                    return (series * 100).round(2)
+                return series.round(2)
+
+            if fs_col:
+                out["fast_swing_pct"] = _to_percent_scale(fs_col)
+            if sq_col:
+                out["squared_up_pct"] = _to_percent_scale(sq_col)
+            if iaa_col:
+                out["ideal_attack_angle_pct"] = _to_percent_scale(iaa_col)
+
+            # v43.57: capture pre-dropna shape so a "no rows after filtering"
+            # status tells us WHY. Without this, we knew the filter killed
+            # everything but not what the input looked like.
+            _pre_drop_rows = len(out)
+            _pre_drop_pid_valid = int(out["player_id"].notna().sum()) if not out.empty else 0
+            _pre_drop_blast_valid = int(out["blast_pct"].notna().sum()) if not out.empty else 0
+
+            # Filter to rows with non-null blast_pct AND valid player_id
+            out = out.dropna(subset=["blast_pct", "player_id"])
+            out["player_id"] = out["player_id"].astype("Int64")
+
+            if out.empty:
+                # v43.57: log column-level failure detail so the app can
+                # surface it via last_bat_tracking_columns(). The `global`
+                # statement is already at the top of this function.
+                _LAST_BAT_TRACKING_COLS = list(df.columns)
+                _pid_matched = pid_col if pid_col else "(none — no MLBAM-like column found)"
+                _reason = (
+                    f"pre-dropna: {_pre_drop_rows} rows, "
+                    f"player_id valid: {_pre_drop_pid_valid}, "
+                    f"blast_pct valid: {_pre_drop_blast_valid}. "
+                    f"Matched player_id col: '{_pid_matched}'. "
+                    f"Matched blast col: '{blast_col}'."
+                )
+                return pd.DataFrame(), f"❌ no rows after filtering — {_reason}", list(df.columns)
+            return out, f"✅ {len(out)} hitters (min={_url_min})", list(df.columns)
+        except Exception:
+            # Try next URL
+            continue
+
+    return pd.DataFrame(), "❌ all endpoints failed (Savant schema drift?)", []
+
+
+# ----------------------------------------------------------------------------
+# Safe parsers - handle MLB Stats API "-.--" and other junk values
+# ----------------------------------------------------------------------------
+
+def _safe_float(val):
+    """Convert API value to float; return None for '-.--', '', or invalid."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        try:
+            f = float(val)
+            return f if not (f != f) else None  # NaN check
+        except (TypeError, ValueError):
+            return None
+    s = str(val).strip()
+    if s in ("", "-.--", "--", "-", ".---", "null", "None"):
+        return None
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def _safe_ip(val):
+    """v46.07: Convert MLB innings-pitched notation to a real decimal.
+    MLB returns IP where the fraction counts THIRDS: '5.1'=5+1/3, '5.2'=5+2/3.
+    _safe_float treats '5.1' as 5.1 (WRONG), skewing ERA/WHIP/K9/BB9/HR9.
+    Convert PER GAME then sum — never convert an already-summed base-10 total."""
+    v = _safe_float(val)
+    if v is None:
+        return None
+    whole = int(v)
+    frac = round(v - whole, 1)
+    if frac == 0.1:
+        return whole + 1.0 / 3.0
+    if frac == 0.2:
+        return whole + 2.0 / 3.0
+    return v
+
+
+def _safe_int(val):
+    """Convert API value to int; return None for '-.--', '', or invalid."""
+    if val is None:
+        return None
+    if isinstance(val, int):
+        return val
+    s = str(val).strip()
+    if s in ("", "-.--", "--", "-", "null", "None"):
+        return None
+    try:
+        return int(float(s))
+    except (ValueError, TypeError):
+        return None
+
+
+# ----------------------------------------------------------------------------
+# Shared normalizers - keep player_id types consistent across all sources
+# ----------------------------------------------------------------------------
+
+def _normalize_player_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure player_id is a consistent integer type so merges work.
+    Also rename common column aliases that Savant uses inconsistently.
+    """
+    if df is None or df.empty:
+        return df
+    if "player_id" not in df.columns:
+        for cand in ["mlb_id", "playerid", "MLBAMID", "mlbam_id", "player_mlb_id"]:
+            if cand in df.columns:
+                df = df.rename(columns={cand: "player_id"})
+                break
+    if "player_id" in df.columns:
+        df["player_id"] = pd.to_numeric(df["player_id"], errors="coerce").astype("Int64")
+
+    # Savant sometimes returns these under alternate names - normalize so
+    # downstream code finds them under one canonical name.
+    rename_map = {}
+    for alias, canonical in [
+        ("isolated_power", "iso"),
+        ("la", "launch_angle"),
+        ("ev", "launch_speed"),
+        ("hardhit_percent", "hard_hit_percent"),
+        ("barrel_percent", "barrel_batted_rate"),
+        ("xba_diff", "xba_minus_ba_diff"),
+    ]:
+        if alias in df.columns and canonical not in df.columns:
+            rename_map[alias] = canonical
+    if rename_map:
+        df = df.rename(columns=rename_map)
+    return df
+
+
+def _derive_hitter_missing(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute commonly-missing hitter columns from real underlying stats.
+    These are math identities (ISO = SLG - AVG), not fake defaults.
+    """
+    if df is None or df.empty:
+        return df
+
+    # ISO from SLG - AVG if missing or all-null
+    needs_iso = "iso" not in df.columns or df["iso"].isna().all()
+    if needs_iso:
+        slg_col = next((c for c in ["slg", "slugging_percentage"] if c in df.columns), None)
+        avg_col = next((c for c in ["batting_avg", "avg", "ba"] if c in df.columns), None)
+        if slg_col and avg_col:
+            df["iso"] = (df[slg_col] - df[avg_col]).round(3)
+
+    return df
+
+
+# ----------------------------------------------------------------------------
+# Slate / probable pitchers (MLB Stats API)
+# ----------------------------------------------------------------------------
+
+@st.cache_data(ttl=300)  # 5min — was 30min; probable pitchers change throughout the day
+def get_slate(game_date: Optional[str] = None) -> pd.DataFrame:
+    """
+    Return one row per game for the given date (YYYY-MM-DD, default today).
+    Columns: gamePk, gameTime, away_team, home_team, away_team_id, home_team_id,
+             away_pitcher, home_pitcher, away_pitcher_id, home_pitcher_id, venue
+    """
+    if game_date is None:
+        game_date = date.today().isoformat()
+    # v44.01: reset the dropped-games counter for this build
+    try:
+        globals()["_SLATE_DROPPED_GAMES"] = 0
+    except Exception:
+        pass
+
+    url = (
+        "https://statsapi.mlb.com/api/v1/schedule"
+        f"?sportId=1&date={game_date}"
+        "&hydrate=probablePitcher,linescore,team"
+    )
+    # Retry with exponential backoff. MLB Stats API occasionally times out
+    # under load — three quick retries instead of one long timeout reduces
+    # the chance of a hard app failure.
+    data = None
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=20)
+            r.raise_for_status()
+            data = r.json()
+            break
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            last_err = e
+            if attempt < 2:
+                import time as _time
+                _time.sleep(0.5 * (2 ** attempt))  # 0.5s, then 1s
+            continue
+        except Exception as e:
+            last_err = e
+            break
+    if data is None:
+        # Raise so Streamlit DOESN'T cache an empty result. The app.py
+        # caller catches this and shows a friendly error.
+        raise ConnectionError(
+            f"Unable to fetch MLB schedule for {game_date} after 3 attempts. "
+            f"Last error: {type(last_err).__name__}"
+        )
+
+    rows = []
+    # v45.14 (user-flagged: ASG appeared as a slate on Jul 14): exclude
+    # exhibition-type games — A = All-Star, E = exhibition, S = spring training.
+    # NOT a filter TO "R" only: postseason gameTypes (F/D/L/W) must still flow
+    # in October. Keeping the ASG out here means it never gets scored,
+    # auto-snapshotted, or banked into pattern history (outcome grading was
+    # already protected by the v44.87 gameType=R filter in backtest.py).
+    _EXCLUDED_GAME_TYPES = {"A", "E", "S"}
+    for d in data.get("dates", []):
+        for g in d.get("games", []):
+            _gt = str(g.get("gameType") or "").upper()
+            if _gt in _EXCLUDED_GAME_TYPES:
+                continue
+            away = g["teams"]["away"]
+            home = g["teams"]["home"]
             rows.append({
-                "game_pk": game["gamePk"], "game_time": game.get("gameDate"), "status": status,
-                "venue": game.get("venue", {}).get("name", "—"),
-                "away_team": away["team"].get("abbreviation", away["team"]["name"][:3].upper()),
-                "home_team": home["team"].get("abbreviation", home["team"]["name"][:3].upper()),
-                "away_team_id": away["team"]["id"], "home_team_id": home["team"]["id"],
-                "away_pitcher": away_pitcher_obj.get("fullName", "TBD"),
-                "home_pitcher": home_pitcher_obj.get("fullName", "TBD"),
-                "away_pitcher_id": away_pitcher_obj.get("id"),
-                "home_pitcher_id": home_pitcher_obj.get("id"),
-                "away_pitcher_hand": away_hand,
-                "home_pitcher_hand": home_hand,
+                "gamePk": g["gamePk"],
+                "gameTime": g.get("gameDate"),
+                "status": g.get("status", {}).get("detailedState"),
+                # v45.38: doubleheader identification for game labels
+                "doubleHeader": g.get("doubleHeader", "N"),
+                "gameNumber": g.get("gameNumber", 1),
+                "venue": g.get("venue", {}).get("name"),
+                "venue_id": g.get("venue", {}).get("id"),  # v43.26 — for park history
+                "away_team": away["team"]["name"],
+                "away_team_abbr": away["team"].get("abbreviation",
+                                                   away["team"]["name"][:3].upper()),
+                "away_team_id": away["team"]["id"],
+                "home_team": home["team"]["name"],
+                "home_team_abbr": home["team"].get("abbreviation",
+                                                   home["team"]["name"][:3].upper()),
+                "home_team_id": home["team"]["id"],
+                "away_pitcher": (away.get("probablePitcher") or {}).get("fullName", "TBD"),
+                "away_pitcher_id": (away.get("probablePitcher") or {}).get("id"),
+                "home_pitcher": (home.get("probablePitcher") or {}).get("fullName", "TBD"),
+                "home_pitcher_id": (home.get("probablePitcher") or {}).get("id"),
             })
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["gameTime"] = pd.to_datetime(df["gameTime"], errors="coerce")
+        # v44.01 (user-reported: phantom 2nd Brewers game showing Gasser):
+        # the schedule endpoint returns EVERY game on the date, including
+        # ones that won't be played — postponed, cancelled, suspended — each
+        # carrying its own probablePitcher. Without filtering, a postponed
+        # game appeared as a real matchup (e.g. a scrapped doubleheader
+        # game 2), attaching a wrong pitcher to a team that's only playing
+        # once. Drop non-playable statuses. Keep anything scheduled, live,
+        # warmup, pre-game, delayed, or final — only exclude games MLB has
+        # marked as not happening.
+        # v45.29: PREFIX match, not exact — MLB emits colon-suffixed variants
+        # ("Suspended: Rain", "Postponed: Inclement Weather"); exact isin()
+        # let those slip through as live games. "Delayed" deliberately NOT
+        # in the prefix set: delayed games still get played.
+        # v45.38 (user's missing BOS@TB game): "Suspended" REMOVED from the
+        # drop list. A suspended game appearing on TODAY's date is a game
+        # that RESUMES today — hitters bat, homers count. Rain-delayed
+        # ("Delayed...") was always kept. Only never-happening statuses drop.
+        _dead_prefixes = (
+            "Postponed", "Cancelled", "Canceled",
+            "Forfeit", "Completed Early",
+        )
+        if "status" in df.columns:
+            _before = len(df)
+            _status_str = df["status"].astype(str)
+            _drop_mask = _status_str.str.startswith(_dead_prefixes)
+            # v45.38: capture WHO got dropped and WHY, so the UI can name
+            # them ("PIT @ CHC — Postponed") instead of a bare count.
+            try:
+                _dd_rows = df[_drop_mask]
+                _dropped_details = [
+                    f"{r.get('away_team_abbr', '?')} @ {r.get('home_team_abbr', '?')} — {r.get('status', '?')}"
+                    for _, r in _dd_rows.iterrows()
+                ]
+            except Exception:
+                _dropped_details = []
+            df = df[~_drop_mask].reset_index(drop=True)
+            _dropped = _before - len(df)
+            if _dropped > 0:
+                # Surface it so the user sees WHY a game vanished rather
+                # than silently changing the slate.
+                try:
+                    globals().setdefault("_SLATE_DROPPED_GAMES", 0)
+                    globals()["_SLATE_DROPPED_GAMES"] += _dropped
+                    globals()["_SLATE_DROPPED_DETAILS"] = _dropped_details
+                except Exception:
+                    pass
+    # v44.60 (code review #6): also embed the dropped count in the DataFrame's
+    # .attrs. get_slate is @st.cache_data, so on a cache HIT the body above
+    # doesn't run and the module global _SLATE_DROPPED_GAMES keeps a stale value
+    # from a different date's build. .attrs travels WITH the cached frame, so
+    # slate_dropped_games() can read the correct per-slate count either way.
+    try:
+        df.attrs["dropped_games"] = int(globals().get("_SLATE_DROPPED_GAMES", 0) or 0)
+        df.attrs["dropped_details"] = list(globals().get("_SLATE_DROPPED_DETAILS", []) or [])
+    except Exception:
+        pass
+    return df
+
+
+def slate_dropped_games(slate_df: "pd.DataFrame | None" = None) -> int:
+    """v44.01: count of games dropped from the slate build for being
+    postponed/cancelled/suspended. Surfaced in Pipeline Health so the user
+    understands why a matchup isn't shown.
+
+    v44.60 (code review #6): prefer the count embedded in the passed slate's
+    .attrs (correct even on a cache hit) over the module global (which can be
+    stale from a different date's build). Falls back to the global if no slate
+    is passed or it carries no attr.
+    """
+    if slate_df is not None:
+        try:
+            _v = slate_df.attrs.get("dropped_games")
+            if _v is not None:
+                return int(_v)
+        except Exception:
+            pass
+    return int(globals().get("_SLATE_DROPPED_GAMES", 0) or 0)
+
+
+@st.cache_data(ttl=180)  # 3min — lineups are posted/changed throughout afternoon
+def get_lineup(game_pk: int, side: str = "home") -> list[dict]:
+    """
+    Return the projected/actual lineup for a side ("home" or "away").
+    Falls back to recent starters if lineup not yet posted.
+    """
+    url = f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        boxscore = r.json().get("liveData", {}).get("boxscore", {})
+        team = boxscore.get("teams", {}).get(side, {})
+        batting_order = team.get("battingOrder", [])
+        players = team.get("players", {})
+        out = []
+        for pid in batting_order:
+            p = players.get(f"ID{pid}", {})
+            person = p.get("person", {})
+            out.append({
+                "id": person.get("id"),
+                "name": person.get("fullName"),
+                "position": p.get("position", {}).get("abbreviation"),
+                "bats": p.get("batSide", {}).get("code"),
+            })
+        return out
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=900)  # 15min — catches mid-day call-ups, IL moves, demotions
+def get_team_roster(team_id: int) -> list[dict]:
+    """Active roster + 40-man roster for a team — used as lineup fallback.
+
+    v38h fix: previously only pulled `/roster/active` (28-man), which silently
+    excluded freshly-called-up players (Pinango, McAdoo, Crooks, fresh
+    September promos) and players DFA'd or transferred mid-season but still
+    appearing in recent lineups. Now pulls 40-man roster AND active roster,
+    merges them with active flagged first.
+
+    The MLB Stats API has multiple roster types:
+      active        — 28-man currently active
+      40Man         — full 40-man (includes AAA-stashed players)
+      fullSeason    — all players who appeared this year (huge, noisy)
+
+    We use active + 40Man combined. Players on 40-man but not active are
+    typically AAA stashes that can be recalled any day — exactly the gap
+    that causes Pinango/McAdoo-tier omissions.
+
+    Hydrates with person.bats so bench players have batting handedness.
+    """
+    seen_ids = set()
+    out = []
+
+    def _fetch(roster_type):
+        url = (
+            f"https://statsapi.mlb.com/api/v1/teams/{team_id}/roster/{roster_type}"
+            "?hydrate=person"
+        )
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            r.raise_for_status()
+            return r.json().get("roster", [])
+        except Exception:
+            return []
+
+    # Pull active first (these are the most reliable), then 40-man (catches AAA stashes)
+    for roster_type in ("active", "40Man"):
+        roster_data = _fetch(roster_type)
+        for p in roster_data:
+            pos = p.get("position", {}).get("abbreviation", "")
+            if pos in ("P", "SP", "RP"):
+                continue
+            person = p.get("person", {}) or {}
+            pid = person.get("id") or p.get("person", {}).get("id")
+            if not pid or pid in seen_ids:
+                continue
+            seen_ids.add(pid)
+            bats = ((person.get("batSide") or {}).get("code")
+                    or (p.get("batSide") or {}).get("code"))
+            out.append({
+                "id": pid,
+                "name": person.get("fullName") or p["person"]["fullName"],
+                "position": pos,
+                "bats": bats,
+                "roster_type": roster_type,  # diagnostic — "active" or "40Man"
+            })
+    return out
+
+
+@st.cache_data(ttl=900)
+def get_team_pitchers(team_id: int) -> list[dict]:
+    """v42v: Active + 40-man pitcher roster for a team.
+
+    Used by the Pitcher Lookup utility so users can scout any pitcher,
+    not just today's probable starter. Mirrors get_team_roster's logic but
+    INCLUDES pitchers (which get_team_roster excludes for the hitter
+    fallback flow). Returns dicts with id, name, position (P/SP/RP),
+    throws (R/L/?), and roster_type ("active" or "40Man").
+    """
+    seen_ids = set()
+    out = []
+
+    def _fetch(roster_type):
+        url = (
+            f"https://statsapi.mlb.com/api/v1/teams/{team_id}/roster/{roster_type}"
+            "?hydrate=person"
+        )
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            r.raise_for_status()
+            return r.json().get("roster", [])
+        except Exception:
+            return []
+
+    for roster_type in ("active", "40Man"):
+        roster_data = _fetch(roster_type)
+        for p in roster_data:
+            pos = p.get("position", {}).get("abbreviation", "")
+            if pos not in ("P", "SP", "RP"):
+                continue
+            person = p.get("person", {}) or {}
+            pid = person.get("id") or p.get("person", {}).get("id")
+            if not pid or pid in seen_ids:
+                continue
+            seen_ids.add(pid)
+            throws = ((person.get("pitchHand") or {}).get("code")
+                      or (p.get("pitchHand") or {}).get("code") or "?")
+            out.append({
+                "id": pid,
+                "name": person.get("fullName") or p["person"]["fullName"],
+                "position": pos,
+                "throws": throws,
+                "roster_type": roster_type,
+            })
+    return out
+
+
+@st.cache_data(ttl=900)  # 15min refresh — catches IL moves within 15 min
+def get_active_roster_ids(team_id: int) -> set:
+    """
+    Return set of player_ids currently on the 26-man ACTIVE roster.
+
+    Used for hitter IL detection (v39g). The active roster updates within
+    minutes of any IL move — much faster than the MLB transactions API
+    which can lag 12-24 hours.
+
+    A hitter showing in our slate but NOT in get_active_roster_ids means
+    they're either on the IL, optioned, or DFA'd. All three states mean
+    they shouldn't play tonight regardless of why our pipeline pulled them.
+
+    Returns empty set on any failure (downstream treats empty as "skip
+    this filter" rather than penalizing everyone).
+    """
+    url = f"https://statsapi.mlb.com/api/v1/teams/{team_id}/roster/active"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        r.raise_for_status()
+        return {
+            p["person"]["id"] for p in r.json().get("roster", [])
+            if p.get("person", {}).get("id")
+        }
+    except Exception:
+        return set()
+
+
+@st.cache_data(ttl=3600)  # 1hr — schedule/lineups don't change for past games
+def get_team_recent_starts(team_id: int, lookback_days: int = 14,
+                            _cache_version: str = "v1") -> dict:
+    """
+    v42n: Returns {player_id: starts_count} for a team's recent games.
+
+    Counts how many times each player appeared in the starting lineup over
+    the past `lookback_days` days. Used by _fill_to_nine to detect real
+    regular starters whose season PA is artificially low due to recent IL
+    time (CJ Abrams, Willy Adames archetype) — they'd otherwise be
+    demoted to the bench by the naive PA-sort.
+
+    Implementation: single MLB Stats API call per team with
+    `?hydrate=lineups` to get every game's lineup in one shot. Cached 1hr
+    so repeat slates are free.
+
+    Returns {} on any failure — caller treats empty dict as "no recent
+    data, fall back to PA sort."
+
+    Args:
+      team_id: MLB team ID
+      lookback_days: how far back to count (default 14)
+      _cache_version: bump to force cache invalidation
+    """
+    from datetime import date as _date, timedelta as _td
+    today = _date.today()
+    start = today - _td(days=lookback_days)
+    url = (
+        f"https://statsapi.mlb.com/api/v1/schedule"
+        f"?sportId=1&teamId={team_id}"
+        f"&startDate={start.isoformat()}&endDate={today.isoformat()}"
+        f"&hydrate=lineups"
+    )
+    starts = {}
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        return {}
+
+    for date_block in data.get("dates", []):
+        for game in date_block.get("games", []):
+            status = (game.get("status", {}) or {}).get("abstractGameState", "")
+            # Only count completed games — in-progress / scheduled games
+            # haven't generated meaningful starting-lineup data yet
+            if status not in ("Final", "Live", "In Progress"):
+                continue
+
+            # Determine which side this team was on
+            away_id = (game.get("teams", {}).get("away", {})
+                            .get("team", {}).get("id"))
+            home_id = (game.get("teams", {}).get("home", {})
+                            .get("team", {}).get("id"))
+            if away_id == team_id:
+                side_key = "awayPlayers"
+            elif home_id == team_id:
+                side_key = "homePlayers"
+            else:
+                continue
+
+            lineups = game.get("lineups", {}) or {}
+            players = lineups.get(side_key, []) or []
+            # Lineup hydration returns position players in batting order.
+            # Each entry is a person dict — count this as a "start" for them.
+            for p in players:
+                pid = (p or {}).get("id")
+                if pid is None:
+                    continue
+                starts[pid] = starts.get(pid, 0) + 1
+    return starts
+
+
+# ----------------------------------------------------------------------------
+# Hitter season stats (Baseball Savant custom leaderboard)
+# ----------------------------------------------------------------------------
+
+@st.cache_data(ttl=3600)
+def _get_hitter_stats_backup(season: int) -> pd.DataFrame:
+    """v44.26: backup hitter-stats source when the primary Savant custom
+    leaderboard fails. Tries an alternate Savant endpoint first (still
+    Statcast), then the MLB Stats API (keyless, already used across this app)
+    for core rate stats. Returns whatever it can; empty DataFrame if all fail.
+
+    Note: the MLB Stats API path does NOT carry Statcast batted-ball metrics
+    (barrel%, distance, EV) — those are Savant-only. When this fallback fires,
+    those columns stay empty and the model uses its documented proxies. The
+    point is graceful degradation (app stays up with core stats) rather than
+    a full Statcast substitute.
+    """
+    # --- Attempt 1: alternate Savant endpoint (expected_statistics) ---
+    try:
+        _alt_url = (
+            "https://baseballsavant.mlb.com/leaderboard/expected_statistics"
+            f"?type=batter&year={season}&position=&team=&filterType=&min=1&csv=true"
+        )
+        r = requests.get(_alt_url, headers=HEADERS, timeout=25)
+        if r.ok and r.text and len(r.text) > 200:
+            _adf = pd.read_csv(io.StringIO(r.text))
+            if not _adf.empty and len(_adf) > 50:
+                if "last_name, first_name" in _adf.columns:
+                    _adf["player_name"] = _adf["last_name, first_name"].apply(
+                        lambda s: " ".join(reversed([p.strip() for p in str(s).split(",")]))
+                        if isinstance(s, str) and "," in s else s)
+                for cand in ["mlb_id", "playerid", "MLBAMID"]:
+                    if cand in _adf.columns and "player_id" not in _adf.columns:
+                        _adf = _adf.rename(columns={cand: "player_id"})
+                if "player_id" in _adf.columns:
+                    return _adf
+    except Exception:
+        pass
+
+    # --- Attempt 2: MLB Stats API season hitting leaders (keyless) ---
+    try:
+        _stats_url = (
+            "https://statsapi.mlb.com/api/v1/stats"
+            f"?stats=season&group=hitting&season={season}"
+            "&gameType=R&limit=1500&sportId=1"
+        )
+        r = requests.get(_stats_url, headers=HEADERS, timeout=25)
+        if r.ok:
+            _j = r.json()
+            _rows = []
+            for _split in (_j.get("stats") or []):
+                for _s in (_split.get("splits") or []):
+                    _stat = _s.get("stat", {}) or {}
+                    _pl = _s.get("player", {}) or {}
+                    try:
+                        _pa = int(_stat.get("plateAppearances") or 0)
+                    except (ValueError, TypeError):
+                        _pa = 0
+                    if _pa < 1:
+                        continue
+                    _rows.append({
+                        "player_id": _pl.get("id"),
+                        "player_name": _pl.get("fullName"),
+                        "pa": _pa,
+                        "home_run": _num(_stat.get("homeRuns")),
+                        "batting_avg": _num(_stat.get("avg")),
+                        "slg": _num(_stat.get("slg")),
+                        "obp": _num(_stat.get("obp")),
+                        "on_base_plus_slg": _num(_stat.get("ops")),
+                        "hits": _num(_stat.get("hits")),
+                        "abs": _num(_stat.get("atBats")),
+                    })
+            if _rows:
+                _mdf = pd.DataFrame(_rows)
+                # derive ISO from SLG - AVG (Statcast batted-ball stays empty)
+                if "slg" in _mdf.columns and "batting_avg" in _mdf.columns:
+                    _mdf["iso"] = (pd.to_numeric(_mdf["slg"], errors="coerce")
+                                   - pd.to_numeric(_mdf["batting_avg"], errors="coerce")).round(3)
+                _mdf["_backup_source"] = "mlb_stats_api"
+                return _mdf
+    except Exception:
+        pass
+
+    return pd.DataFrame()
+
+
+def _num(v):
+    """Coerce a stat string/number to float, else None."""
+    try:
+        if v is None or v == "" or v == "-.--" or v == ".---":
+            return None
+        return float(v)
+    except (ValueError, TypeError):
+        return None
+
+
+@st.cache_data(ttl=3600)
+def get_hitter_stats(season: int = None, stats_day: str = "") -> pd.DataFrame:
+    """
+    Pull season-level Statcast hitter stats with ALL columns needed for the
+    dashboard: standard rates, expected stats, batted-ball quality, pulled
+    contact, fly ball %, launch angle, swing/miss, etc.
+
+    _stats_day is a cache-buster set by the caller (defaults to today's ET stats
+    date via _stats_day_key()). Including it in the signature makes Streamlit
+    treat a new day as a cache miss — so morning users get fresh stats without
+    waiting for the 1-hour TTL.
+    """
+    season = season if season is not None else current_season()  # v44.62
+    # v43.66 (researcher framework): added avg_hit_distance (for Must-Have
+    # threshold ≥315 ft / Nuclear ≥330 ft) and barrels (raw barrel COUNT,
+    # used to derive a near_hr_est = max(0, barrels - home_run) for the
+    # Nuclear "Near HR ≥3" threshold). Both come from the same Savant
+    # custom leaderboard with no extra HTTP call.
+    selections = (
+        "pa,abs,hits,player_age,k_percent,bb_percent,woba,xwoba,xiso,xba,xslg,xobp,"
+        "iso,babip,slg,obp,batting_avg,on_base_plus_slg,home_run,"
+        "barrel_batted_rate,barrels,solidcontact_percent,flareburner_percent,"
+        "poorlyunder_percent,poorlytopped_percent,poorlyweak_percent,"
+        "hard_hit_percent,avg_best_speed,avg_hit_angle,launch_speed,launch_angle,"
+        "avg_hit_distance,"
+        "whiff_percent,swing_percent,sweet_spot_percent,xwobacon,wobacon,"
+        "groundballs_percent,flyballs_percent,linedrives_percent,popups_percent,"
+        "pull_percent,straightaway_percent,opposite_percent,"
+        "pull_air_percent,straightaway_air_percent,opposite_air_percent,"
+        "z_swing_percent,z_swing_miss_percent,oz_swing_percent,oz_swing_miss_percent,"
+        "f_strike_percent,zone_percent"
+    )
+    url = (
+        "https://baseballsavant.mlb.com/leaderboard/custom"
+        f"?year={season}&type=batter&filter=&min=1&selections={selections}"
+        "&chart=false&x=pa&y=pa&r=no&chartType=beeswarm&csv=true"
+    )
+    # Savant occasionally times out under load. Retry with backoff.
+    df = None
+    for attempt in range(3):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=30)
+            r.raise_for_status()
+            df = pd.read_csv(io.StringIO(r.text))
+            break
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            if attempt < 2:
+                import time as _time
+                _time.sleep(1.0 * (2 ** attempt))
+            continue
+        except Exception:
+            break
+    if df is None or df.empty:
+        # v44.26 — BACKUP SOURCES before giving up. The primary custom
+        # leaderboard occasionally fails or gets rate-limited. Rather than
+        # crash the whole app, try documented fallbacks in order:
+        #   1. Alternate Savant endpoint (expected_statistics leaderboard) —
+        #      still Statcast, just a different URL that sometimes survives
+        #      when the custom one is throttled.
+        #   2. MLB Stats API season hitting stats — NOT Statcast (no barrel/
+        #      distance), but gives the core rate stats (HR, AVG, SLG, OBP,
+        #      K%, BB%) so the app degrades gracefully instead of going dark.
+        #      This is the same keyless API the app already uses 25+ places.
+        df = _get_hitter_stats_backup(season)
+        if df is None or df.empty:
+            # Raise so Streamlit doesn't cache empty. Caller shows warning.
+            raise ConnectionError("Baseball Savant + backup sources all unreachable for hitter stats")
+    if "last_name, first_name" in df.columns:
+        df["player_name"] = df["last_name, first_name"].apply(
+            lambda s: " ".join(reversed([p.strip() for p in str(s).split(",")]))
+            if isinstance(s, str) and "," in s else s
+        )
+    if "player_id" not in df.columns:
+        for cand in ["mlb_id", "playerid", "MLBAMID"]:
+            if cand in df.columns:
+                df = df.rename(columns={cand: "player_id"})
+                break
+    # Compute PulledBrl% as approximation. Savant may return pull data under
+    # several names depending on endpoint version.
+    pull_col = None
+    for cand in ["pull_air_percent", "pull_percent", "pull_pct", "pulled_percent"]:
+        if cand in df.columns and df[cand].notna().any():
+            pull_col = cand
+            break
+    if pull_col and "barrel_batted_rate" in df.columns:
+        df["pulled_brl_pct"] = (
+            pd.to_numeric(df[pull_col], errors="coerce") *
+            pd.to_numeric(df["barrel_batted_rate"], errors="coerce") / 100
+        ).round(2)
+
+    # CRITICAL: Always derive ISO at source if missing/null.
+    # Savant's leaderboard sometimes returns 'iso' as an empty column even
+    # when requested. SLG-AVG is the math definition of ISO.
+    if "iso" not in df.columns or df["iso"].isna().all():
+        for slg_col in ["slg", "xslg", "slugging_pct"]:
+            if slg_col not in df.columns:
+                continue
+            for avg_col in ["batting_avg", "avg", "ba", "xba"]:
+                if avg_col not in df.columns:
+                    continue
+                df["iso"] = (df[slg_col] - df[avg_col]).round(3)
+                break
+            if "iso" in df.columns and df["iso"].notna().any():
+                break
+
+    # Clamp ISO at zero. ISO = SLG - AVG, which is mathematically ≥ 0 because
+    # every hit contributes to SLG with weight ≥ AVG-weight (a single counts
+    # 1 in both, a double counts 2 in SLG vs 1 in AVG, etc). Negative values
+    # only appear when Savant returns xISO for tiny samples (expected stats
+    # can invert at low PA). Affects ~9 fringe hitters with PA < 80 — they're
+    # already excluded from picks via the PA gate, but the displayed value
+    # looks like a data error. Clamping fixes the display without altering
+    # downstream calculations (negatives never reach the projections).
+    if "iso" in df.columns:
+        df["iso"] = pd.to_numeric(df["iso"], errors="coerce").clip(lower=0)
+
+    # LA must come from a real Statcast source. NEVER estimated/derived.
+    # Try every known column name where Savant might return real LA data.
+    la_candidates = [
+        "launch_angle", "launch_angle_avg", "avg_hit_angle",
+        "la", "la_avg", "attack_angle", "swing_path_tilt",
+        "average_la", "avg_la",
+    ]
+    populated_la = None
+    for cand in la_candidates:
+        if cand not in df.columns:
+            continue
+        coerced = pd.to_numeric(df[cand], errors="coerce")
+        if coerced.notna().any():
+            df[cand] = coerced
+            populated_la = cand
+            break
+
+    if populated_la and populated_la != "launch_angle":
+        df["launch_angle"] = df[populated_la]
+    elif populated_la is None and "launch_angle" not in df.columns:
+        df["launch_angle"] = pd.NA
+    # Real LA only - no FB%/GB% estimation
+
+    # If LA still missing, try a sequence of Savant endpoints known to return it.
+    # Each is independent and uses a different URL pattern.
+    # v43.68 (production-validated): this same exit-velocity endpoint also
+    # returns avg_hit_distance and raw `barrels` count — fields that the
+    # custom leaderboard at the top of this function does NOT expose. So we
+    # extend this loop to ALSO populate avg_dist and barrel_count when present,
+    # even if launch_angle is already populated. Researcher's Nuclear filter
+    # needs these for ~3 of its 14 criteria; without them Nuclear grades go dark.
+    # Pre-check: are we missing any of {LA, avg_dist, barrel_count}? If so,
+    # hit the endpoint.
+    needs_la = (
+        "launch_angle" in df.columns and df["launch_angle"].isna().all()
+    )
+    needs_dist = (
+        "avg_dist" not in df.columns
+        or df.get("avg_dist", pd.Series(dtype=float)).isna().all()
+    )
+    needs_barrels = (
+        "barrel_count" not in df.columns
+        or df.get("barrel_count", pd.Series(dtype=float)).isna().all()
+    )
+    if needs_la or needs_dist or needs_barrels:
+        # v43.69 (production-debug): per-URL diagnostic so we can see what's
+        # happening when the merge produces all-NaN.
+        global _LAST_DISTANCE_DIAG
+        _LAST_DISTANCE_DIAG = []
+        la_urls = [
+            # v44.23: the EXIT VELOCITY & BARRELS leaderboard is the one that
+            # actually carries avg HR distance, barrel COUNT, BBE, and avg HR
+            # exit velocity — the generic statcast leaderboard omits distance.
+            # Try it first with both the modern and legacy path.
+            f"https://baseballsavant.mlb.com/leaderboard/exit_velocity"
+            f"?type=batter&year={season}&team=&min=&csv=true",
+            f"https://baseballsavant.mlb.com/leaderboard/exit-velocity"
+            f"?type=batter&year={season}&min=&csv=true",
+            # v43.69: canonical Statcast leaderboard (has barrel rate, EV, some
+            # distance depending on Savant's current schema).
+            f"https://baseballsavant.mlb.com/leaderboard/statcast"
+            f"?type=batter&year={season}&team=&min=&csv=true",
+            # Original exit-velocity + barrels endpoint
+            f"https://baseballsavant.mlb.com/leaderboard/statcast"
+            f"?type=batter&year={season}&position=&team=&min=1&csv=true",
+            # Custom leaderboard with explicit distance/barrel selections
+            f"https://baseballsavant.mlb.com/leaderboard/custom"
+            f"?year={season}&type=batter&filter=&min=1"
+            f"&selections=pa,launch_angle,launch_speed,avg_hit_angle,"
+            f"avg_distance,avg_hr_distance,barrels,avg_hr_hit_speed"
+            f"&chart=false&x=pa&y=pa&r=no&csv=true",
+        ]
+        # Cast df["player_id"] to a stable type for dict lookups. Previous
+        # bug: mixing Int64 (from ev_df) and float (from df) made map() miss
+        # every row even when the data was present.
+        try:
+            df["player_id"] = pd.to_numeric(df["player_id"], errors="coerce").astype("Int64")
+        except Exception:
+            pass
+
+        for url in la_urls:
+            diag_entry = {
+                "url": url[:100] + "..." if len(url) > 100 else url,
+                "status": None,
+                "n_rows": 0,
+                "cols_sample": [],
+                "id_col": None,
+                "la_col": None,
+                "dist_col": None,
+                "brl_col": None,
+                "dist_merged": 0,
+                "brl_merged": 0,
+                "la_merged": 0,
+                "error": None,
+            }
+            try:
+                rr = requests.get(url, headers=HEADERS, timeout=20)
+                diag_entry["status"] = rr.status_code
+                rr.raise_for_status()
+                ev_df = pd.read_csv(io.StringIO(rr.text))
+                diag_entry["n_rows"] = len(ev_df)
+                diag_entry["cols_sample"] = list(ev_df.columns)[:25]
+                if ev_df.empty:
+                    _LAST_DISTANCE_DIAG.append(diag_entry)
+                    continue
+                # Find ID column once for all merges below
+                id_col = None
+                for cand in ["player_id", "mlb_id", "MLBAMID", "playerid", "id"]:
+                    if cand in ev_df.columns:
+                        id_col = cand
+                        break
+                diag_entry["id_col"] = id_col
+                if not id_col:
+                    _LAST_DISTANCE_DIAG.append(diag_entry)
+                    continue
+                ev_df[id_col] = pd.to_numeric(
+                    ev_df[id_col], errors="coerce"
+                ).astype("Int64")
+
+                # v43.72 (production-debug): switched from dict.map() to
+                # pd.merge() because Int64 + dict lookup was silently failing
+                # for the slate's actual lineup player_ids. The .map worked
+                # for 254 df rows but the 254 were NOT the lineup hitters —
+                # a pandas Int64 hash mismatch issue. pd.merge handles this
+                # correctly because it uses pandas' join semantics with proper
+                # dtype harmonization.
+
+                # Build a small subset to merge
+                merge_cols = [id_col]
+                merge_renames = {id_col: "player_id"}
+
+                # ----- LA (existing logic, unchanged at top) -----
+                if needs_la:
+                    la_col = None
+                    for cand in ["launch_angle", "avg_hit_angle", "angle",
+                                  "avg_launch_angle", "avg_la", "la"]:
+                        if cand in ev_df.columns:
+                            coerced = pd.to_numeric(ev_df[cand], errors="coerce")
+                            if coerced.notna().any():
+                                ev_df[cand] = coerced
+                                la_col = cand
+                                break
+                    diag_entry["la_col"] = la_col
+                    if la_col:
+                        merge_cols.append(la_col)
+                        merge_renames[la_col] = "_la_from_ev"
+
+                # ----- v43.68/v44.23: Avg Distance -----
+                # v44.23: HR-specific distance columns FIRST (that's what the
+                # Moonshot target wants), then all-batted-ball distance as a
+                # fallback proxy. The Exit Velocity & Barrels leaderboard uses
+                # avg_hr_distance / avg_home_run_distance.
+                if needs_dist:
+                    dist_col = None
+                    for cand in ["avg_hr_distance", "avg_home_run_distance",
+                                  "hr_distance", "avg_hit_distance",
+                                  "avg_distance", "distance", "hit_distance",
+                                  "avg_dist"]:
+                        if cand in ev_df.columns:
+                            coerced = pd.to_numeric(ev_df[cand], errors="coerce")
+                            if coerced.notna().any():
+                                ev_df[cand] = coerced
+                                dist_col = cand
+                                break
+                    diag_entry["dist_col"] = dist_col
+                    if dist_col:
+                        merge_cols.append(dist_col)
+                        merge_renames[dist_col] = "_dist_from_ev"
+
+                # ----- v44.23: Avg HR Exit Velocity (for the Laser target) -----
+                _hrev_col = None
+                for cand in ["avg_hr_hit_speed", "avg_hr_exit_velocity",
+                              "avg_home_run_hit_speed", "hr_launch_speed"]:
+                    if cand in ev_df.columns:
+                        coerced = pd.to_numeric(ev_df[cand], errors="coerce")
+                        if coerced.notna().any():
+                            ev_df[cand] = coerced
+                            _hrev_col = cand
+                            break
+                if _hrev_col:
+                    merge_cols.append(_hrev_col)
+                    merge_renames[_hrev_col] = "_hrev_from_ev"
+
+                # ----- v43.68: Barrels (raw count) -----
+                if needs_barrels:
+                    brl_col = None
+                    for cand in ["barrels", "barrel", "n_barrels",
+                                  "barrels_total", "barrel_count"]:
+                        if cand in ev_df.columns:
+                            coerced = pd.to_numeric(ev_df[cand], errors="coerce")
+                            if coerced.notna().any():
+                                ev_df[cand] = coerced
+                                brl_col = cand
+                                break
+                    diag_entry["brl_col"] = brl_col
+                    if brl_col:
+                        merge_cols.append(brl_col)
+                        merge_renames[brl_col] = "_brl_from_ev"
+
+                # If we picked up at least one mappable column, do a proper merge
+                if len(merge_cols) > 1:
+                    ev_subset = ev_df[merge_cols].copy().rename(columns=merge_renames)
+                    # Drop any rows with NA player_id (they can't merge)
+                    ev_subset = ev_subset.dropna(subset=["player_id"])
+                    # Deduplicate on player_id (keep last) to handle Savant duplicates
+                    ev_subset = ev_subset.drop_duplicates(subset=["player_id"], keep="last")
+
+                    # v43.73 (production-debug): capture SAMPLE player_ids from
+                    # each source to definitively diagnose whether the merge is
+                    # working OR whether the ID systems differ.
+                    try:
+                        ev_ids = set(int(x) for x in ev_subset["player_id"].dropna().head(50).tolist())
+                        df_ids = set(int(x) for x in df["player_id"].dropna().head(200).tolist())
+                        overlap_ids = ev_ids & df_ids
+                        diag_entry["ev_sample_ids"] = sorted(list(ev_ids))[:5]
+                        diag_entry["df_sample_ids"] = sorted(list(df_ids))[:5]
+                        diag_entry["overlap_size"] = len(overlap_ids)
+                        diag_entry["ev_sample_size"] = len(ev_ids)
+                        diag_entry["df_sample_size"] = len(df_ids)
+                    except Exception:
+                        pass
+
+                    # v43.74: REPLACED pd.merge with explicit Python int dict.
+                    # Pandas Int64 dtype + pd.merge was producing apparently
+                    # correct counts (253 merged) but the merged rows were not
+                    # the rows that matched the lineup ids — a hash mismatch
+                    # symptom. Going through raw Python ints bypasses any
+                    # pandas nullable-integer weirdness. Verified correct on
+                    # small synthetic test before shipping.
+                    #
+                    # v43.82 (reviewer-noted): the _lookup_la / _lookup_dist /
+                    # _lookup_brl closures below capture the la_dict / dist_dict /
+                    # brl_dict from THIS iteration. Safe because df["player_id"]
+                    # .apply(_lookup_*) fires immediately in the same block.
+                    # DANGER: if any of these applies is ever deferred or the
+                    # dicts get reused across URL loop iterations, closure will
+                    # read the LAST iteration's dict. Fix in that case:
+                    #     def _lookup_dist(pid, _dict=dist_dict): ...
+                    if needs_la and "_la_from_ev" in ev_subset.columns:
+                        la_dict = {}
+                        for pid, val in zip(
+                            ev_subset["player_id"], ev_subset["_la_from_ev"]
+                        ):
+                            try:
+                                if pd.notna(pid):
+                                    la_dict[int(pid)] = (
+                                        float(val) if pd.notna(val) else None
+                                    )
+                            except (ValueError, TypeError):
+                                continue
+
+                        def _lookup_la(pid, _dict=la_dict):
+                            try:
+                                if pd.isna(pid):
+                                    return None
+                                return _dict.get(int(pid))
+                            except (ValueError, TypeError):
+                                return None
+
+                        new_la = df["player_id"].apply(_lookup_la)
+                        # Preserve any LA already present from primary fetch
+                        if "launch_angle" in df.columns:
+                            df["launch_angle"] = df["launch_angle"].fillna(new_la)
+                        else:
+                            df["launch_angle"] = new_la
+                        diag_entry["la_merged"] = int(df["launch_angle"].notna().sum())
+                        if df["launch_angle"].notna().any():
+                            needs_la = False
+
+                    if needs_dist and "_dist_from_ev" in ev_subset.columns:
+                        dist_dict = {}
+                        for pid, val in zip(
+                            ev_subset["player_id"], ev_subset["_dist_from_ev"]
+                        ):
+                            try:
+                                if pd.notna(pid):
+                                    dist_dict[int(pid)] = (
+                                        float(val) if pd.notna(val) else None
+                                    )
+                            except (ValueError, TypeError):
+                                continue
+
+                        def _lookup_dist(pid, _dict=dist_dict):
+                            try:
+                                if pd.isna(pid):
+                                    return None
+                                return dist_dict.get(int(pid))
+                            except (ValueError, TypeError):
+                                return None
+
+                        df["avg_dist"] = df["player_id"].apply(_lookup_dist)
+                        # Round non-null values
+                        try:
+                            df["avg_dist"] = pd.to_numeric(
+                                df["avg_dist"], errors="coerce"
+                            ).round(0)
+                        except Exception:
+                            pass
+                        # v44.29 (bug fix): the Moonshot target, display, and
+                        # tooltips all read the column `avg_hr_distance`, but
+                        # this merge historically only wrote `avg_dist` — so the
+                        # data was fetched into a column nothing consumed. When
+                        # the source column WAS the HR-specific distance
+                        # (avg_hr_distance / avg_home_run_distance / hr_distance),
+                        # also populate avg_hr_distance so the picks upgrade to
+                        # real distance. If it was only all-batted-ball distance,
+                        # leave avg_hr_distance empty (don't mislabel it as HR).
+                        if dist_col in ("avg_hr_distance", "avg_home_run_distance",
+                                        "hr_distance"):
+                            df["avg_hr_distance"] = df["avg_dist"]
+                        diag_entry["dist_merged"] = int(df["avg_dist"].notna().sum())
+                        if df["avg_dist"].notna().any():
+                            needs_dist = False
+
+                    if needs_barrels and "_brl_from_ev" in ev_subset.columns:
+                        brl_dict = {}
+                        for pid, val in zip(
+                            ev_subset["player_id"], ev_subset["_brl_from_ev"]
+                        ):
+                            try:
+                                if pd.notna(pid):
+                                    brl_dict[int(pid)] = (
+                                        float(val) if pd.notna(val) else None
+                                    )
+                            except (ValueError, TypeError):
+                                continue
+
+                        def _lookup_brl(pid, _dict=brl_dict):
+                            try:
+                                if pd.isna(pid):
+                                    return None
+                                return _dict.get(int(pid))
+                            except (ValueError, TypeError):
+                                return None
+
+                        df["barrel_count"] = df["player_id"].apply(_lookup_brl)
+                        try:
+                            df["barrel_count"] = pd.to_numeric(
+                                df["barrel_count"], errors="coerce"
+                            ).round(0)
+                        except Exception:
+                            pass
+                        diag_entry["brl_merged"] = int(df["barrel_count"].notna().sum())
+                        if df["barrel_count"].notna().any():
+                            needs_barrels = False
+
+                    # v44.23: avg HR exit velocity → avg_hr_ev (for the Laser
+                    # target alongside regular avg_ev). Always attempt when the
+                    # column was captured, independent of la/dist/barrel needs.
+                    if "_hrev_from_ev" in ev_subset.columns:
+                        _hrev_dict = {}
+                        for pid, val in zip(
+                            ev_subset["player_id"], ev_subset["_hrev_from_ev"]
+                        ):
+                            try:
+                                if pd.notna(pid):
+                                    _hrev_dict[int(pid)] = (
+                                        float(val) if pd.notna(val) else None
+                                    )
+                            except (ValueError, TypeError):
+                                continue
+
+                        def _lookup_hrev(pid, _d=_hrev_dict):
+                            try:
+                                if pd.isna(pid):
+                                    return None
+                                return _d.get(int(pid))
+                            except (ValueError, TypeError):
+                                return None
+
+                        _new_hrev = df["player_id"].apply(_lookup_hrev)
+                        if "avg_hr_ev" in df.columns:
+                            df["avg_hr_ev"] = pd.to_numeric(
+                                df["avg_hr_ev"], errors="coerce").fillna(_new_hrev)
+                        else:
+                            df["avg_hr_ev"] = _new_hrev
+                        try:
+                            df["avg_hr_ev"] = pd.to_numeric(
+                                df["avg_hr_ev"], errors="coerce").round(1)
+                        except Exception:
+                            pass
+                        diag_entry["hrev_merged"] = int(df["avg_hr_ev"].notna().sum())
+
+                _LAST_DISTANCE_DIAG.append(diag_entry)
+                # If everything's populated, stop trying URLs
+                if not (needs_la or needs_dist or needs_barrels):
+                    break
+            except Exception as _url_err:
+                diag_entry["error"] = f"{type(_url_err).__name__}: {str(_url_err)[:120]}"
+                _LAST_DISTANCE_DIAG.append(diag_entry)
+                continue
+
+        # v43.69: also stash to session_state so the diag survives the
+        # @st.cache_data wrapper on next call (cache hit doesn't run this code).
+        try:
+            st.session_state["_last_distance_diag"] = list(_LAST_DISTANCE_DIAG)
+        except Exception:
+            pass
+
+    # Normalize player_id type for merges + derive missing columns
+    df = _normalize_player_df(df)
+    df = _derive_hitter_missing(df)
+
+    # Clean up float precision artifacts at source so downstream code doesn't
+    # need to repeat rounding. Different metrics get different precision.
+    # NOTE: previously this dict had TWO `1:` keys, which silently overwrote
+    # the first — meaning all percentage columns (k_percent, barrel_batted_rate,
+    # hard_hit_percent, etc.) weren't being rounded at all. Now merged.
+    round_specs = {
+        # Ratios stored as 0-1 → 3 decimals
+        3: ["iso", "xwoba", "xwobacon", "xslg", "xobp", "xba", "slg", "obp",
+            "ops", "batting_avg", "babip", "avg", "woba"],
+        # Percentages (0-100) and velocities/angles → 1 decimal
+        1: ["k_percent", "bb_percent", "whiff_percent", "swing_percent",
+            "barrel_batted_rate", "hard_hit_percent", "sweet_spot_percent",
+            "flyballs_percent", "groundballs_percent", "linedrives_percent",
+            "popups_percent", "pull_percent", "pull_air_percent",
+            "straightaway_percent", "opposite_percent", "z_swing_percent",
+            "oz_swing_percent", "f_strike_percent", "zone_percent",
+            "csw_percent",
+            "launch_speed", "launch_angle", "avg_best_speed", "avg_hit_angle"],
+    }
+    for digits, cols in round_specs.items():
+        for c in cols:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce").round(digits)
+
+    # v42s: defensive numeric coercion + outlier clipping
+    # Catches Savant edge cases where columns occasionally contain string
+    # junk values or extreme outliers from tiny-sample players.
+    df = enforce_numeric(df, [
+        "barrel_batted_rate", "hard_hit_percent", "iso", "xwoba", "xwobacon",
+        "launch_angle", "launch_speed", "pull_percent",
+        "flyballs_percent", "groundballs_percent", "linedrives_percent",
+        "k_percent", "bb_percent", "avg_best_speed",
+    ])
+    df = clip_outliers(df)
+    # v46.13/46.21: SAVANT COLUMN-DRIFT GUARD moved to a standalone function
+    # (check_savant_drift) so it can ALSO run at the call site — @st.cache_data
+    # skips this function body on a cache hit, which left the status "unknown".
+    check_savant_drift(df)
+    return df
+
+
+def check_savant_drift(df) -> str:
+    """v46.21: verify the CRITICAL scoring columns are present with real values,
+    and stash the result to session_state for Pipeline Health. Runs both inside
+    get_hitter_stats AND at the app call site (so a cache hit doesn't leave the
+    status 'unknown'). Returns the status string.
+    EV note: build_matchup_table picks the best-populated of {avg_best_speed,
+    exit_velocity_avg, launch_speed} → avg_ev, so EV is OK if ANY source has
+    data — checking the single 'launch_speed' false-alarmed."""
+    try:
+        import streamlit as _stx
+        if df is None or not hasattr(df, "columns") or df.empty:
+            _stx.session_state["_savant_drift_status"] = "unknown (no hitter data this run)"
+            return "unknown"
+        _critical = ["barrel_batted_rate", "hard_hit_percent", "iso", "xwoba",
+                     "xslg", "k_percent", "bb_percent"]
+        _ev_sources = ["launch_speed", "avg_best_speed", "exit_velocity_avg", "avg_ev"]
+        _missing = [c for c in _critical if c not in df.columns]
+        _empty = [c for c in _critical if c in df.columns
+                  and pd.to_numeric(df[c], errors="coerce").notna().sum() == 0]
+        _ev_ok = any(
+            c in df.columns and pd.to_numeric(df[c], errors="coerce").notna().sum() > 0
+            for c in _ev_sources)
+        if not _ev_ok:
+            _empty.append("exit-velo (all sources empty)")
+        if _missing or _empty:
+            _mp = []
+            if _missing:
+                _mp.append(f"MISSING: {', '.join(_missing)}")
+            if _empty:
+                _mp.append(f"ALL-EMPTY: {', '.join(_empty)}")
+            _status = ("\u26a0\ufe0f Savant column drift (BROKEN) \u2014 "
+                       + " | ".join(_mp) + " (a rename likely broke a derived stat)")
+        else:
+            _status = "\u2705 all critical Savant columns present"
+        _stx.session_state["_savant_drift_status"] = _status
+        return _status
+    except Exception:
+        return "unknown"
+
+
+# ----------------------------------------------------------------------------
+# Pitcher season stats
+# ----------------------------------------------------------------------------
+
+@st.cache_data(ttl=3600)
+def get_pitcher_stats(season: int = None, stats_day: str = "") -> pd.DataFrame:
+    """Season-level Statcast pitcher stats - expanded.
+
+    Now requests stats that let us derive ERA-equivalents independently of
+    MLB Stats API: xera, slg (SLG against), obp (OBP against), hits, walks,
+    earned_runs, home_run, etc. This way if MLB Stats API is unreachable
+    (which happens on Streamlit Cloud), we still have everything we need.
+    """
+    season = season if season is not None else current_season()  # v44.62
+    selections = (
+        # Core Statcast
+        "pa,k_percent,bb_percent,woba,xwoba,xiso,xba,xslg,xobp,xera,"
+        "barrel_batted_rate,hard_hit_percent,avg_best_speed,avg_hit_angle,"
+        "whiff_percent,swing_percent,sweet_spot_percent,xwobacon,iso,babip,"
+        "launch_speed,launch_angle,p_total_pitches,p_total_swinging_strike,"
+        "csw_percent,zone_percent,in_zone_swing_miss_percent,"
+        "f_strike_percent,oz_swing_percent,z_swing_percent,"
+        "groundballs_percent,flyballs_percent,linedrives_percent,popups_percent,"
+        "pull_percent,straightaway_percent,opposite_percent,"
+        # Real outcome stats (ERA-equivalent derivation)
+        "home_run,slg,obp,batting_avg,hits,walks_drawn,earned_runs,"
+        "ab,strikeout,plate_appearances"
+    )
+    url = (
+        "https://baseballsavant.mlb.com/leaderboard/custom"
+        f"?year={season}&type=pitcher&filter=&min=1&selections={selections}"
+        "&chart=false&x=pa&y=pa&r=no&chartType=beeswarm&csv=true"
+    )
+    # Retry with backoff for transient Savant timeouts
+    df = None
+    for attempt in range(3):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=30)
+            r.raise_for_status()
+            df = pd.read_csv(io.StringIO(r.text))
+            break
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            if attempt < 2:
+                import time as _time
+                _time.sleep(1.0 * (2 ** attempt))
+            continue
+        except Exception:
+            break
+    if df is None or df.empty:
+        raise ConnectionError("Baseball Savant unreachable for pitcher stats after 3 attempts")
+    if "last_name, first_name" in df.columns:
+        df["player_name"] = df["last_name, first_name"].apply(
+            lambda s: " ".join(reversed([p.strip() for p in str(s).split(",")]))
+            if isinstance(s, str) and "," in s else s
+        )
+    df = _normalize_player_df(df)
+
+    # ------------------------------------------------------------------
+    # SAVANT-DERIVED ERA/WHIP equivalents - work even when MLB Stats API dies
+    # ------------------------------------------------------------------
+    # Statcast 'pa' is plate appearances faced. ~4.3 PA per IP league average.
+    if "pa" in df.columns:
+        df["ip_savant"] = (df["pa"] / 4.3).round(1)
+        # If MLB Stats API gave us real IP later, that will overwrite this.
+        # For now, use ip_savant as the IP value.
+        df["ip"] = df["ip_savant"]
+    # K/9 from K% × 4.3 PA per IP
+    if "k_percent" in df.columns:
+        df["k9_savant"] = (df["k_percent"] * 4.3 * 9 / 100).round(2)
+        df["k9"] = df["k9_savant"]
+    # BB/9 from BB% × 4.3 PA per IP
+    if "bb_percent" in df.columns:
+        df["bb9_savant"] = (df["bb_percent"] * 4.3 * 9 / 100).round(2)
+        df["bb9"] = df["bb9_savant"]
+    # WHIP from (H + BB) / IP - if Savant gave us hits and walks
+    # Cap at 5.0 to prevent absurd values from tiny IP samples (Savant IP is
+    # estimated from PA which can be off by ~30% in small samples).
+    if ("hits" in df.columns and "walks_drawn" in df.columns and "ip_savant" in df.columns
+            and _has_real_values(df, "hits", min_n=20)
+            and _has_real_values(df, "walks_drawn", min_n=20)):
+        whip_raw = (df["hits"] + df["walks_drawn"]) / df["ip_savant"].replace(0, pd.NA)
+        df["whip_savant"] = whip_raw.clip(upper=5.0).round(2)
+        df["whip"] = df["whip_savant"]
+    # ERA from earned_runs × 9 / IP
+    # Cap at 12.0: Savant IP is estimated from PA (pa / 4.3) which gets
+    # inflated for tiny samples. Jordan Wicks case (May 2026): 24 PA gave
+    # ip_savant=5.58 but real IP was 4.1, making ERA derive to 16.62 vs
+    # real ~12.4. The cap prevents the display from showing nonsense values.
+    # Real ERA gets prioritized in the coalesce step (app.py) when available.
+    if ("earned_runs" in df.columns and "ip_savant" in df.columns
+            and _has_real_values(df, "earned_runs", min_n=20)):
+        era_raw = df["earned_runs"] * 9 / df["ip_savant"].replace(0, pd.NA)
+        df["era_savant"] = era_raw.clip(upper=12.0).round(2)
+        df["era"] = df["era_savant"]
+    # HR/9 from home_run × 9 / IP — cap at 6.0 for the same reason
+    if "home_run" in df.columns and "ip_savant" in df.columns:
+        hr9_raw = df["home_run"] * 9 / df["ip_savant"].replace(0, pd.NA)
+        df["hr9_savant"] = hr9_raw.clip(upper=6.0).round(2)
+        df["hr9"] = df["hr9_savant"]
+
+    # v42s: defensive numeric coercion + outlier clipping (same pattern as hitter side)
+    df = enforce_numeric(df, [
+        "era", "whip", "hr9", "k9", "bb9",
+        "barrel_batted_rate", "hard_hit_percent",
+        "launch_angle", "launch_speed", "avg_best_speed", "xera",
+        "k_percent", "bb_percent",
+    ])
+    df = clip_outliers(df)
+    return df
+
+
+# ----------------------------------------------------------------------------
+# Pitcher splits vs LHB / vs RHB - critical for handedness matchup analysis
+# ----------------------------------------------------------------------------
+
+def _fetch_pitcher_splits_single(pitcher_id: int, season: int) -> dict:
+    """
+    Fetch a single pitcher's vs-LHB and vs-RHB splits from MLB Stats API.
+    Returns dict with keys like vs_lhb_pa, vs_lhb_hr_per_pa, vs_lhb_avg, etc.
+
+    MLB Stats API field names vary; try several variations and derive
+    HR% / K% from atBats if plateAppearances isn't returned.
+    """
+    out = {}
+    url = (
+        f"https://statsapi.mlb.com/api/v1/people/{pitcher_id}/stats"
+        f"?stats=statSplits&sitCodes=vl,vr&group=pitching&season={season}"
+    )
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        if r.status_code != 200:
+            return out
+        data = r.json()
+        for stat_group in data.get("stats", []):
+            for split in stat_group.get("splits", []):
+                code = split.get("split", {}).get("code", "")
+                if code == "vl":
+                    label = "lhb"
+                elif code == "vr":
+                    label = "rhb"
+                else:
+                    continue
+                stat = split.get("stat", {})
+
+                # Try multiple field names (MLB API has variations)
+                pa = (stat.get("plateAppearances") or stat.get("battersFaced")
+                      or stat.get("totalBattersFaced") or stat.get("pa"))
+                ab = stat.get("atBats") or stat.get("ab")
+                hr = stat.get("homeRuns") or stat.get("hr")
+                k = stat.get("strikeOuts") or stat.get("strikeouts") or stat.get("so")
+                bb = (stat.get("baseOnBalls") or stat.get("walks")
+                      or stat.get("bb") or stat.get("baseonballs"))
+                avg = stat.get("avg") or stat.get("battingAverage")
+                obp = stat.get("obp") or stat.get("onBasePercentage")
+                slg = stat.get("slg") or stat.get("sluggingPercentage")
+                hits = stat.get("hits") or stat.get("h")
+
+                # Type-cast counts safely
+                def _to_int(v):
+                    if v is None: return None
+                    try: return int(v)
+                    except (TypeError, ValueError):
+                        try: return int(float(v))
+                        except (TypeError, ValueError): return None
+
+                pa = _to_int(pa)
+                ab = _to_int(ab)
+                hr = _to_int(hr)
+                k = _to_int(k)
+                bb = _to_int(bb)
+                hits = _to_int(hits)
+
+                # If PA is missing but we have AB and BB, derive: PA ≈ AB + BB
+                # (ignoring HBP/SF which are small).
+                if (pa is None or pa == 0) and ab and bb is not None:
+                    pa = ab + bb
+
+                # v43.90 (review completion): SEPARATE denominators — same fix
+                # the reviewer prompted for _parse_stat_split_response in v43.78,
+                # but this sibling parser was missed. HR/PA must use PA only;
+                # an AB fallback yields HR/AB (~10% overstated) under a _per_pa
+                # name. K%/BB% keep the AB fallback (tolerable approximation).
+                denom_pa_strict = pa if (pa and pa > 0) else None
+                denom = pa if (pa and pa > 0) else ab
+
+                if pa and pa > 0:
+                    out[f"vs_{label}_pa"] = pa
+                if denom and denom > 0:
+                    # If HR field exists, use it. If MISSING but split has decent
+                    # sample (PA>=20) AND SLG is modest (<.400), assume 0 HRs
+                    # (the API often omits zero-count fields for "good" pitchers
+                    # who gave up no HRs to one side). This was the Yesavage bug:
+                    # 54 PA, .269 SLG, no HR field = should be 0% not NaN.
+                    if hr is not None and denom_pa_strict:
+                        out[f"vs_{label}_hr_per_pa"] = round(hr / denom_pa_strict * 100, 3)
+                    if hr is not None:
+                        # v43.11: persist HR count so "3 HRs allowed to LHB in
+                        # 180 PA" is visible alongside the rate. Helps spot
+                        # situational vulnerability that the rate-only signal
+                        # buries (e.g., 4 HRs in 35 vs-LHB PA is a real signal
+                        # even though it's the same rate as 2 HRs in 17 PA).
+                        out[f"vs_{label}_hr"] = hr
+                    # v40: If HR field is ABSENT, leave vs_*_hr_per_pa unset.
+                    # Previously fabricated 0.0 when slg<.320 — but a missing
+                    # field is an ambiguous API omission, and a fake 0%
+                    # propagates into _platoon_hr_flag (creating spurious 💥
+                    # vulnerability flags + +4 pick_score bonus to opposing
+                    # hitters) and the display. props.py separately derives
+                    # a real low rate from SLG for pitcher_mult, so this
+                    # doesn't hurt the projection path.
+                    if k is not None:
+                        out[f"vs_{label}_k_percent"] = round(k / denom * 100, 2)
+                    if bb is not None:
+                        out[f"vs_{label}_bb_percent"] = round(bb / denom * 100, 2)
+                if avg:
+                    try: out[f"vs_{label}_avg"] = float(avg)
+                    except (TypeError, ValueError): pass
+                if obp:
+                    try: out[f"vs_{label}_obp"] = float(obp)
+                    except (TypeError, ValueError): pass
+                if slg:
+                    try: out[f"vs_{label}_slg"] = float(slg)
+                    except (TypeError, ValueError): pass
+    except Exception:
+        pass
+    return out
+
+
+@st.cache_data(ttl=3600)
+def get_pitcher_handedness_splits(season: int = None,
+                                    pitcher_ids: tuple = (),
+                                    _cache_version: str = "v1") -> pd.DataFrame:
+    """
+    Fetch vs-LHB and vs-RHB splits from MLB Stats API for the given pitcher IDs.
+
+    Why MLB Stats API instead of Savant: Savant's /custom endpoint doesn't
+    accept hfStands param reliably; statSplits via the MLB API IS documented
+    and stable.
+
+    Pass the list of pitcher_ids from today's slate to avoid fetching
+    splits for every pitcher in the league (~700 calls).
+
+    _cache_version: bump when adding new fields to invalidate cache.
+    """
+    season = season if season is not None else current_season()  # v44.62
+    if not pitcher_ids:
+        return pd.DataFrame()
+
+    rows = []
+    for pid in pitcher_ids:
+        try:
+            pid_int = int(pid)
+        except (TypeError, ValueError):
+            continue
+        splits = _fetch_pitcher_splits_single(pid_int, season)
+        if splits:
+            splits["player_id"] = pid_int
+            rows.append(splits)
+    if not rows:
+        return pd.DataFrame()
     return pd.DataFrame(rows)
 
 
-@st.cache_data(ttl=180, show_spinner=False)
-def get_lineup(game_pk: int, side: str) -> list[dict]:
-    """Confirmed batting order when posted."""
+# ----------------------------------------------------------------------------
+# HITTER splits vs LHP / vs RHP - the SINGLE biggest accuracy gap in the model
+# until June 2026. Reference apps that nail platoon predictions all use these.
+#
+# Jo Adell case study: overall barrel% = 8.8% (looks weak) but vs-LHP barrel% =
+# 31.6% (elite). Without these splits, the model uses the 8.8% for ALL matchups
+# and dramatically underestimates Adell vs lefties. Same for any reverse-platoon
+# or strong-platoon hitter.
+# ----------------------------------------------------------------------------
+
+def _fetch_hitter_splits_single(hitter_id: int, season: int) -> dict:
+    """
+    Fetch a single hitter's vs-LHP and vs-RHP splits from MLB Stats API.
+    Returns dict with keys like vs_lhp_pa, vs_lhp_hr_per_pa, vs_lhp_iso, etc.
+
+    Field naming convention: `vs_lhp_*` / `vs_rhp_*` (vs pitcher hand).
+    Note this differs from pitcher splits which use `vs_lhb_*` / `vs_rhb_*`
+    (vs batter hand). The codes from MLB API are the same (vl/vr) but the
+    semantic is opposite depending on the player type.
+    """
+    out = {}
+    url = (
+        f"https://statsapi.mlb.com/api/v1/people/{hitter_id}/stats"
+        f"?stats=statSplits&sitCodes=vl,vr&group=hitting&season={season}"
+    )
     try:
-        payload = _get(f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live", timeout=LINEUP_TIMEOUT).json()
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        if r.status_code != 200:
+            return out
+        data = r.json()
+        for stat_group in data.get("stats", []):
+            for split in stat_group.get("splits", []):
+                code = split.get("split", {}).get("code", "")
+                # For HITTERS: vl = vs LHP, vr = vs RHP
+                if code == "vl":
+                    label = "lhp"
+                elif code == "vr":
+                    label = "rhp"
+                else:
+                    continue
+                stat = split.get("stat", {})
+
+                def _to_int(v):
+                    if v is None: return None
+                    try: return int(v)
+                    except (TypeError, ValueError):
+                        try: return int(float(v))
+                        except (TypeError, ValueError): return None
+
+                def _to_float(v):
+                    if v is None: return None
+                    try: return float(v)
+                    except (TypeError, ValueError): return None
+
+                pa = _to_int(stat.get("plateAppearances") or stat.get("pa"))
+                ab = _to_int(stat.get("atBats") or stat.get("ab"))
+                hr = _to_int(stat.get("homeRuns") or stat.get("hr"))
+                k = _to_int(stat.get("strikeOuts") or stat.get("so"))
+                bb = _to_int(stat.get("baseOnBalls") or stat.get("bb"))
+                # v43.82 cleanup: `hits` was assigned but never used
+                avg = _to_float(stat.get("avg") or stat.get("battingAverage"))
+                obp = _to_float(stat.get("obp") or stat.get("onBasePercentage"))
+                slg = _to_float(stat.get("slg") or stat.get("sluggingPercentage"))
+                ops = _to_float(stat.get("ops"))
+
+                if pa is None and ab and bb is not None:
+                    pa = ab + bb
+                # v43.90 (review completion): strict PA denominator for HR/PA —
+                # sibling of the v43.78 fix; see comment at the pitcher parser.
+                denom_pa_strict = pa if (pa and pa > 0) else None
+                denom = pa if (pa and pa > 0) else ab
+
+                if pa and pa > 0:
+                    out[f"vs_{label}_pa"] = pa
+                if denom and denom > 0:
+                    if hr is not None and denom_pa_strict:
+                        out[f"vs_{label}_hr_per_pa"] = round(hr / denom_pa_strict * 100, 3)
+                    if hr is not None:
+                        # v43.11: persist the raw HR count too. Rate alone hides
+                        # whether "3% vs LHP" is "1 HR in 33 PA" (noise) or
+                        # "12 HRs in 400 PA" (real platoon signal).
+                        out[f"vs_{label}_hr"] = hr
+                    if k is not None:
+                        out[f"vs_{label}_k_percent"] = round(k / denom * 100, 2)
+                    if bb is not None:
+                        out[f"vs_{label}_bb_percent"] = round(bb / denom * 100, 2)
+                if avg is not None:
+                    out[f"vs_{label}_avg"] = avg
+                if obp is not None:
+                    out[f"vs_{label}_obp"] = obp
+                if slg is not None:
+                    out[f"vs_{label}_slg"] = slg
+                    # ISO = SLG - AVG (the math definition)
+                    if avg is not None:
+                        out[f"vs_{label}_iso"] = round(max(0.0, slg - avg), 3)
+                if ops is not None:
+                    out[f"vs_{label}_ops"] = ops
     except Exception:
-        return []
-    team = payload.get("liveData", {}).get("boxscore", {}).get("teams", {}).get(side, {})
-    players, order = team.get("players", {}), team.get("battingOrder", [])
-    return [{
-        "player_id": person.get("id"), "player_name": person.get("fullName"),
-        "bats": item.get("batSide", {}).get("code", "—"), "lineup_pos": index + 1,
-    } for index, player_id in enumerate(order)
-      if (item := players.get(f"ID{player_id}", {})) and (person := item.get("person", {}))]
+        pass
+    return out
 
 
-@st.cache_data(ttl=900, show_spinner=False)
-def get_team_roster(team_id: int) -> list[dict]:
-    """Active non-pitchers fallback."""
-    try:
-        payload = _get(f"https://statsapi.mlb.com/api/v1/teams/{team_id}/roster/active?hydrate=person", timeout=LINEUP_TIMEOUT).json()
-    except Exception:
-        return []
+@st.cache_data(ttl=3600)
+def get_hitter_handedness_splits(season: int = None,
+                                   hitter_ids: tuple = (),
+                                   _cache_version: str = "v1") -> pd.DataFrame:
+    """
+    Fetch vs-LHP and vs-RHP splits from MLB Stats API for the given hitter IDs.
+
+    Why this matters: a hitter's overall season stats average across BOTH
+    handednesses. For platoon hitters (most of MLB) the rate vs the opposite
+    arm is meaningfully different. Reverse-platoon guys like Jo Adell can have
+    overall barrel% of 8% but vs-LHP barrel% of 31% — without the split,
+    we project him as a weak HR threat vs lefties when he's actually elite.
+
+    Returns DataFrame with columns:
+      player_id, vs_lhp_pa, vs_lhp_avg, vs_lhp_obp, vs_lhp_slg, vs_lhp_iso,
+      vs_lhp_ops, vs_lhp_hr_per_pa, vs_lhp_hr, vs_lhp_k_percent, vs_lhp_bb_percent
+      (and matching vs_rhp_* columns; vs_lhp_hr added v43.11 — raw HR count)
+
+    Pass hitter_ids from today's slate to avoid hammering the API.
+    """
+    season = season if season is not None else current_season()  # v44.62
+    if not hitter_ids:
+        return pd.DataFrame()
+
     rows = []
-    for item in payload.get("roster", []):
-        if item.get("position", {}).get("type") == "Pitcher":
-            continue
-        person = item.get("person", {})
-        rows.append({"player_id": person.get("id"), "player_name": person.get("fullName"),
-                     "bats": ((person.get("batSide") or {}).get("code") or (item.get("batSide") or {}).get("code") or "—"), "lineup_pos": pd.NA})
-    return rows
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_hitter_stats(season: int) -> pd.DataFrame:
-    """Season Statcast power signals."""
-    fields = "player_id,pa,iso,barrel_batted_rate,hard_hit_percent,launch_speed,flyballs_percent,home_run"
-    url = ("https://baseballsavant.mlb.com/leaderboard/custom?"
-           f"year={season}&type=batter&filter=&min=1&selections={fields}&chart=false&x=pa&y=pa&r=no&csv=true")
-    try:
-        df = pd.read_csv(io.StringIO(_get(url).text))
-    except Exception as exc:
-        raise ConnectionError(f"Savant batter failed: {exc}")
-    if df.empty or len(df.columns) < 3:
-        raise ConnectionError("Savant returned empty batter data")
-    name_col = next((c for c in df.columns if c.lower() in ("last_name, first_name", "player_name", "name")), None)
-    if name_col == "last_name, first_name":
-        df["player_name"] = df[name_col].astype(str).map(lambda v: " ".join(reversed([x.strip() for x in v.split(",")])) if "," in v else v)
-    elif name_col:
-        df["player_name"] = df[name_col]
-    else:
-        df["player_name"] = "Unknown"
-    aliases = {"barrel_batted_rate": "barrel_pct", "hard_hit_percent": "hard_hit", "launch_speed": "avg_ev", "flyballs_percent": "fb_pct"}
-    df = df.rename(columns=aliases)
-    for col in ["player_id", "pa", "barrel_pct", "hard_hit", "iso", "avg_ev", "fb_pct", "home_run"]:
-        if col in df:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    keep = [c for c in ["player_id", "player_name", "pa", "barrel_pct", "hard_hit", "iso", "avg_ev", "fb_pct", "home_run"] if c in df]
-    return df[keep].dropna(subset=["player_id"])
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_pitcher_stats(season: int) -> pd.DataFrame:
-    """Pitcher HR/9 from Statcast."""
-    fields = "player_id,home_run,pa"
-    url = ("https://baseballsavant.mlb.com/leaderboard/custom?"
-           f"year={season}&type=pitcher&filter=&min=1&selections={fields}&chart=false&x=pa&y=pa&r=no&csv=true")
-    try:
-        df = pd.read_csv(io.StringIO(_get(url).text))
-    except Exception as exc:
-        raise ConnectionError(f"Savant pitcher failed: {exc}")
-    df["player_id"] = pd.to_numeric(df.get("player_id"), errors="coerce")
-    df["pitcher_hr9"] = (pd.to_numeric(df.get("home_run"), errors="coerce") * 9 / (pd.to_numeric(df.get("pa"), errors="coerce") / 4.3).replace(0, pd.NA)).clip(0, 6)
-    return df[["player_id", "pitcher_hr9"]].dropna(subset=["player_id"])
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def build_live_slate(game_date: str) -> tuple[pd.DataFrame, str]:
-    """Join lineups to power stats."""
-    schedule = get_slate(game_date)
-    if schedule.empty:
-        return pd.DataFrame(), "No MLB games scheduled."
-    hitters = get_hitter_stats(pd.Timestamp(game_date).year)
-    pitchers = get_pitcher_stats(pd.Timestamp(game_date).year)
-    rows, confirmed_sides = [], 0
-    for game in schedule.to_dict("records"):
-        for side, team_key, opp_key, pitcher_key, pitcher_id_key, pitcher_hand_key in [
-            ("away", "away_team", "home_team", "home_pitcher", "home_pitcher_id", "home_pitcher_hand"),
-            ("home", "home_team", "away_team", "away_pitcher", "away_pitcher_id", "away_pitcher_hand"),
-        ]:
-            try:
-                lineup = get_lineup(game["game_pk"], side)
-            except Exception:
-                lineup = []
-            confirmed = bool(lineup)
-            if confirmed:
-                confirmed_sides += 1
-            else:
-                lineup = get_team_roster(game[f"{side}_team_id"])
-            for person in lineup:
-                rows.append({**person, "team": game[team_key], "opponent": game[opp_key],
-                             "game": f"{game['away_team']} @ {game['home_team']}",
-                             "opp_pitcher": game[pitcher_key],
-                             "opp_pitcher_id": game[pitcher_id_key],
-                             "pitcher_hand": game.get(pitcher_hand_key, "R"),
-                             "lineup_confirmed": confirmed,
-                             "is_bench": not confirmed,
-                             "start_time": game["game_time"], "venue": game["venue"]})
-    base = pd.DataFrame(rows)
-    if base.empty:
-        return base, "Games found, but no rosters returned."
-    base["player_id"] = pd.to_numeric(base["player_id"], errors="coerce")
-    base["opp_pitcher_id"] = pd.to_numeric(base["opp_pitcher_id"], errors="coerce")
-    out = base.merge(hitters, on="player_id", how="left", suffixes=("", "_stat"))
-    if "player_name_stat" in out:
-        out["player_name"] = out["player_name"].fillna(out["player_name_stat"])
-    out = out.merge(pitchers.rename(columns={"player_id": "opp_pitcher_id"}), on="opp_pitcher_id", how="left")
-    # Weather
-    venue_context = {}
-    venue_times = list(base[["venue", "start_time"]].drop_duplicates().itertuples(index=False, name=None))
-    def load_venue_context(venue, start_time):
-        park = get_park(venue)
+    for hid in hitter_ids:
         try:
-            weather = fetch_weather(park["lat"], park["lon"], str(start_time)) if park["lat"] is not None else {}
-            return venue, hr_multiplier(weather, park["cf_bearing"], park["roof"])
-        except Exception:
-            return venue, (1.0, "Weather unavailable")
-    max_workers = min(6, len(venue_times)) if venue_times else 1
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(load_venue_context, v, t): (v, t) for v, t in venue_times}
-        for future in as_completed(futures):
+            hid_int = int(hid)
+        except (TypeError, ValueError):
+            continue
+        splits = _fetch_hitter_splits_single(hid_int, season)
+        if splits:
+            splits["player_id"] = hid_int
+            rows.append(splits)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
+# ----------------------------------------------------------------------------
+# Day/Night splits — hitters AND pitchers perform differently in day vs night.
+# Documented effect: most batters slightly worse in day games (~1-3% lower OPS).
+# Some pitchers significantly better at night under lights.
+# ----------------------------------------------------------------------------
+
+def _parse_stat_split_response(data: dict, group: str = "hitting") -> dict:
+    """
+    Parse MLB Stats API statSplits response into vs_day_*/vs_night_* fields.
+    Handles missing fields gracefully (returns whatever's available).
+    Used for both hitters and pitchers.
+
+    Recognizes splits by code (d/n) OR by description ("Day"/"Night") since
+    MLB API responses vary.
+    """
+    out = {}
+    for stat_group in data.get("stats", []):
+        for split in stat_group.get("splits", []):
+            split_meta = split.get("split", {})
+            code = (split_meta.get("code") or "").lower()
+            desc = (split_meta.get("description") or "").lower()
+            # Identify day vs night by code OR description
+            label = None
+            if code == "d" or "day" in desc:
+                label = "day"
+            elif code == "n" or "night" in desc:
+                label = "night"
+            # vs LHB / vs RHB
+            elif code == "vl" or "vs. lhb" in desc or "left" in desc:
+                label = "lhb"
+            elif code == "vr" or "vs. rhb" in desc or "right" in desc:
+                label = "rhb"
+            else:
+                continue
+            stat = split.get("stat", {})
+
+            def _to_int(v):
+                if v is None: return None
+                try: return int(v)
+                except (TypeError, ValueError):
+                    try: return int(float(v))
+                    except (TypeError, ValueError): return None
+
+            pa = (stat.get("plateAppearances") or stat.get("battersFaced")
+                  or stat.get("pa"))
+            ab = stat.get("atBats")
+            hr = stat.get("homeRuns")
+            k = stat.get("strikeOuts") or stat.get("strikeouts")
+            bb = stat.get("baseOnBalls") or stat.get("walks")
+            avg = stat.get("avg")
+            obp = stat.get("obp")
+            slg = stat.get("slg")
+            ops = stat.get("ops")
+
+            pa = _to_int(pa); ab = _to_int(ab); hr = _to_int(hr)
+            k = _to_int(k); bb = _to_int(bb)
+
+            # Derive PA from AB+BB if missing
+            if (pa is None or pa == 0) and ab and bb is not None:
+                pa = ab + bb
+            # v43.78 (auditor-found): SEPARATE denominators for HR/PA vs K/PA.
+            # HR/PA is a headline metric downstream — mixing in an AB fallback
+            # gives HR/AB (~10% overstated) but keeps the _per_pa name. K/PA
+            # is more tolerant of the fallback since it's used as a ratio.
+            # If PA is missing, skip the hr_per_pa emission entirely.
+            denom_pa_strict = pa if (pa and pa > 0) else None
+            denom_ab_fallback = pa if (pa and pa > 0) else ab
+
+            if pa and pa > 0:
+                out[f"vs_{label}_pa"] = pa
+            if denom_pa_strict:
+                if hr is not None:
+                    out[f"vs_{label}_hr_per_pa"] = round(hr / denom_pa_strict * 100, 3)
+                # v40: Absent HR field → leave unset (no fabricated 0.0). A
+                # manufactured 0% reads as elite suppression downstream and
+                # corrupts _platoon_hr_flag (which divides r_safe/l_safe with
+                # min 0.001) — producing 40× ratios that trigger spurious
+                # 💥 RHB-vulnerability flags and +4 pick_score bonuses.
+                # Missing stays missing.
+            if denom_ab_fallback and denom_ab_fallback > 0:
+                if k is not None:
+                    out[f"vs_{label}_k_percent"] = round(k / denom_ab_fallback * 100, 2)
+            if avg:
+                try: out[f"vs_{label}_avg"] = float(avg)
+                except (TypeError, ValueError): pass
+            if obp:
+                try: out[f"vs_{label}_obp"] = float(obp)
+                except (TypeError, ValueError): pass
+            if slg:
+                try: out[f"vs_{label}_slg"] = float(slg)
+                except (TypeError, ValueError): pass
+            if ops:
+                try: out[f"vs_{label}_ops"] = float(ops)
+                except (TypeError, ValueError): pass
+    return out
+
+
+def _fetch_day_night_splits_single(player_id: int, season: int, group: str = "hitting") -> dict:
+    """Fetch day/night splits for one player (hitter or pitcher)."""
+    url = (
+        f"https://statsapi.mlb.com/api/v1/people/{player_id}/stats"
+        f"?stats=statSplits&sitCodes=d,n&group={group}&season={season}"
+    )
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        if r.status_code != 200:
+            return {}
+        return _parse_stat_split_response(r.json(), group)
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=3600)
+def get_hitter_day_night_splits(season: int = None,
+                                  hitter_ids: tuple = (),
+                                  _cache_version: str = "v2") -> pd.DataFrame:
+    """
+    Fetch day/night splits for the given hitter IDs.
+    Only fetches for confirmed lineup spots to avoid 200+ API calls.
+
+    _cache_version: bump when adding new fields to invalidate Streamlit cache.
+    """
+    season = season if season is not None else current_season()  # v44.62
+    if not hitter_ids:
+        return pd.DataFrame()
+    rows = []
+    for pid in hitter_ids:
+        try:
+            pid_int = int(pid)
+        except (TypeError, ValueError):
+            continue
+        splits = _fetch_day_night_splits_single(pid_int, season, "hitting")
+        if splits:
+            splits["player_id"] = pid_int
+            rows.append(splits)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=3600)
+def get_pitcher_day_night_splits(season: int = None,
+                                   pitcher_ids: tuple = (),
+                                   _cache_version: str = "v2") -> pd.DataFrame:
+    """
+    Fetch day/night splits for the given pitcher IDs.
+
+    _cache_version: bump when adding new fields to invalidate Streamlit cache.
+    """
+    season = season if season is not None else current_season()  # v44.62
+    if not pitcher_ids:
+        return pd.DataFrame()
+    rows = []
+    for pid in pitcher_ids:
+        try:
+            pid_int = int(pid)
+        except (TypeError, ValueError):
+            continue
+        splits = _fetch_day_night_splits_single(pid_int, season, "pitching")
+        if splits:
+            splits["player_id"] = pid_int
+            rows.append(splits)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
+def classify_game_day_night(game_time_iso: str, venue_timezone: str = None) -> str:
+    """
+    Classify a game as 'day' or 'night' based on its LOCAL start time.
+    MLB convention: games starting BEFORE 5 PM venue-local are day games.
+
+    venue_timezone: optional IANA timezone string (e.g. "America/Phoenix").
+        If not provided, defaults to "America/New_York" which is WRONG for
+        west-coast venues. Callers should always pass the venue timezone.
+
+    Returns 'day' or 'night'. Defaults to 'night' if classification fails.
+    """
+    try:
+        from datetime import datetime
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:
+            ZoneInfo = None
+        # Parse ISO time (e.g., "2026-05-26T19:05:00Z")
+        if game_time_iso.endswith("Z"):
+            dt_utc = datetime.fromisoformat(game_time_iso[:-1] + "+00:00")
+        else:
+            dt_utc = datetime.fromisoformat(game_time_iso)
+        tz_to_use = venue_timezone or "America/New_York"
+        if ZoneInfo is not None:
             try:
-                venue, context = future.result(timeout=10)
-                venue_context[venue] = context
+                dt_local = dt_utc.astimezone(ZoneInfo(tz_to_use))
             except Exception:
-                venue, _ = futures[future]
-                venue_context[venue] = (1.0, "Weather unavailable")
-    out["park_factor"] = [get_park_hand_factor(venue, bats) for venue, bats in zip(out["venue"], out["bats"])]
-    out["weather_boost"] = out["venue"].map(lambda v: venue_context.get(v, (1.0, "Weather unavailable"))[0])
-    out["weather_note"] = out["venue"].map(lambda v: venue_context.get(v, (1.0, "Weather unavailable"))[1])
-    out["env_boost"] = (out["park_factor"] * out["weather_boost"]).round(2)
-    out["recent_hr"] = pd.NA
-    return out, f"Live slate · {confirmed_sides} confirmed lineups · {len(out)} hitters"
+                # Try fallback to America/New_York if requested zone fails
+                try:
+                    dt_local = dt_utc.astimezone(ZoneInfo("America/New_York"))
+                except Exception:
+                    from datetime import timedelta
+                    dt_local = dt_utc - timedelta(hours=4)
+        else:
+            # Fallback: assume Eastern (UTC-4 in summer, UTC-5 in winter)
+            from datetime import timedelta
+            dt_local = dt_utc - timedelta(hours=4)
+        # 5 PM cutoff is standard for "day game" classification
+        return "day" if dt_local.hour < 17 else "night"
+    except Exception:
+        return "night"
+
+
+# Map of stadium → IANA timezone for accurate day/night classification
+VENUE_TIMEZONES = {
+    # Pacific
+    "Oracle Park": "America/Los_Angeles",
+    "Dodger Stadium": "America/Los_Angeles",
+    "UNIQLO Field at Dodger Stadium": "America/Los_Angeles",  # v43.86 sponsor variant
+    "Petco Park": "America/Los_Angeles",
+    "Angel Stadium": "America/Los_Angeles",
+    "T-Mobile Park": "America/Los_Angeles",
+    "Sutter Health Park": "America/Los_Angeles",  # Athletics 2025+ temporary
+    # Mountain (Arizona never observes DST)
+    "Chase Field": "America/Phoenix",
+    "Coors Field": "America/Denver",
+    "Salt River Fields": "America/Phoenix",  # spring training
+    # Central
+    "Globe Life Field": "America/Chicago",
+    "Daikin Park": "America/Chicago",
+    "Minute Maid Park": "America/Chicago",
+    "Wrigley Field": "America/Chicago",
+    "Guaranteed Rate Field": "America/Chicago",
+    "Rate Field": "America/Chicago",
+    "Target Field": "America/Chicago",
+    "Kauffman Stadium": "America/Chicago",
+    "Busch Stadium": "America/Chicago",
+    "American Family Field": "America/Chicago",
+    # v43.80: Eastern venues added explicitly. Previously these fell through
+    # to the Eastern default — technically correct classification, but the
+    # v43.79 diagnostic fired warnings on them anyway ("unknown venue"),
+    # which was misleading. With the map now complete, the diagnostic only
+    # fires for genuinely unknown venues (name typos, temporary parks,
+    # newly renamed venues) — which is the actionable signal.
+    "Yankee Stadium": "America/New_York",
+    "Citi Field": "America/New_York",
+    "Fenway Park": "America/New_York",
+    "Rogers Centre": "America/New_York",  # Toronto — Eastern Time
+    "Oriole Park at Camden Yards": "America/New_York",
+    "Camden Yards": "America/New_York",  # alt short name
+    "Tropicana Field": "America/New_York",  # Rays historic home
+    "Steinbrenner Field": "America/New_York",  # Rays 2025 temporary
+    "Progressive Field": "America/New_York",
+    "Comerica Park": "America/New_York",
+    "Citizens Bank Park": "America/New_York",
+    "Nationals Park": "America/New_York",
+    "Truist Park": "America/New_York",
+    "loanDepot park": "America/New_York",  # Miami — MLB API lowercase 'l'
+    "LoanDepot park": "America/New_York",  # Alt capitalization
+    "PNC Park": "America/New_York",
+    "Great American Ball Park": "America/New_York",
+    # If a venue is STILL missing, it will surface in the Pipeline Health
+    # diagnostic — indicating a name change, typo, or new venue (e.g. a
+    # future international game or spring training makeup site).
+}
+
+
+# v43.79 (auditor-found): track venue-name misses so we can see which
+# venues need adding to VENUE_TIMEZONES. Previously a west-coast venue
+# whose name didn't match the map keys exactly silently classified as
+# Eastern — leading to wrong day/night assignments for the games most
+# affected by early Pacific-time starts.
+_UNKNOWN_VENUES_SEEN: set = set()
+
+
+def get_venue_timezone(venue_name: str) -> str:
+    """Look up IANA timezone for a venue. Defaults to America/New_York.
+
+    v43.79: unknown venues are recorded to _UNKNOWN_VENUES_SEEN so the
+    app can surface them in Pipeline Health. The Eastern default is
+    safe for ~2/3 of MLB parks but silently mis-classifies west-coast
+    games for any venue whose Savant/MLBAPI name doesn't match our keys
+    exactly (e.g. minor rebrandings, sponsored name changes).
+    """
+    if venue_name and venue_name not in VENUE_TIMEZONES:
+        try:
+            _UNKNOWN_VENUES_SEEN.add(venue_name)
+        except Exception:
+            pass
+    return VENUE_TIMEZONES.get(venue_name, "America/New_York")
+
+
+def unknown_venues_seen() -> list:
+    """Return venues encountered but not in VENUE_TIMEZONES map.
+
+    Used by app.py's Pipeline Health to surface silent misclassification
+    risk — an unknown west-coast venue means day/night is wrong for that
+    game's hitters.
+    """
+    return sorted(_UNKNOWN_VENUES_SEEN)
+
+
+# ----------------------------------------------------------------------------
+# Injury / IL list — return-from-IL fatigue flag for pitchers
+# Pitchers fresh off IL typically throw 30-50 fewer pitches their first start.
+# ----------------------------------------------------------------------------
+
+@st.cache_data(ttl=3600)
+def get_player_il_status(player_id: int, season: int = CURRENT_SEASON) -> dict:
+    """
+    Check if a player has recent IL transactions.
+    Returns {"on_il": bool, "days_since_return": int|None, "il_count_this_season": int}.
+    Uses MLB Stats API transactions endpoint.
+    """
+    out = {"on_il": False, "days_since_return": None, "il_count_this_season": 0}
+    try:
+        from datetime import datetime
+        # Get player's transactions for the season
+        url = (
+            f"https://statsapi.mlb.com/api/v1/transactions"
+            f"?playerId={player_id}&startDate={season}-01-01&endDate={season}-12-31"
+        )
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        if r.status_code != 200:
+            return out
+        data = r.json()
+        transactions = data.get("transactions", [])
+        if not transactions:
+            return out
+
+        # Find most recent IL-related transaction
+        # IMPORTANT: be STRICT here. Earlier versions matched things like:
+        #   - "Selected from minors" (SCL) → flagged as IL
+        #   - "Placed on paternity list" → flagged as IL
+        #   - "Placed on bereavement list" → flagged as IL
+        #   - "Placed on restricted list" → flagged as IL
+        # All false positives. We now ONLY count transactions whose description
+        # explicitly mentions an injured list.
+        today = datetime.now().date()
+        il_count = 0
+        latest_return = None
+        latest_il_placement = None
+        for txn in transactions:
+            description = (txn.get("description") or "").lower()
+            txn_date_str = txn.get("date") or txn.get("effectiveDate")
+            if not txn_date_str:
+                continue
+            try:
+                txn_date = datetime.strptime(txn_date_str[:10], "%Y-%m-%d").date()
+            except Exception:
+                continue
+
+            # STRICT IL test: description must mention an injured list
+            # (10-day IL, 15-day IL, 60-day IL, 7-day concussion IL, etc.)
+            is_il_txn = (
+                "injured list" in description
+                or "the il" in description
+                or "10-day il" in description
+                or "15-day il" in description
+                or "60-day il" in description
+                or "7-day il" in description
+            )
+            # Exclude paternity, bereavement, restricted, suspended, military lists
+            is_other_list = any(kw in description for kw in (
+                "paternity list", "bereavement list", "restricted list",
+                "suspended list", "military list", "family medical",
+            ))
+            if is_other_list:
+                continue  # NOT an IL transaction
+            if not is_il_txn:
+                continue  # not IL related at all
+
+            # Now classify: placement vs. activation
+            is_placement = (
+                "placed" in description
+                or "transferred to" in description
+            )
+            is_activation = (
+                "activated" in description
+                or "reinstated" in description
+            )
+            if is_placement:
+                il_count += 1
+                if latest_il_placement is None or txn_date > latest_il_placement:
+                    latest_il_placement = txn_date
+            elif is_activation:
+                if latest_return is None or txn_date > latest_return:
+                    latest_return = txn_date
+
+        # On IL = latest placement is more recent than latest return
+        if latest_il_placement and (latest_return is None or latest_il_placement > latest_return):
+            out["on_il"] = True
+        if latest_return:
+            out["days_since_return"] = (today - latest_return).days
+        out["il_count_this_season"] = il_count
+        return out
+    except Exception:
+        return out
+
+
+@st.cache_data(ttl=3600)
+def get_pitchers_il_status(pitcher_ids: tuple, season: int = CURRENT_SEASON,
+                             _cache_version: str = "v1") -> pd.DataFrame:
+    """Bulk-fetch IL status for slate pitchers.
+
+    _cache_version: bump when adding new fields to invalidate cache.
+    """
+    if not pitcher_ids:
+        return pd.DataFrame()
+    rows = []
+    for pid in pitcher_ids:
+        try:
+            pid_int = int(pid)
+        except (TypeError, ValueError):
+            continue
+        status = get_player_il_status(pid_int, season)
+        # Include if pitcher has ANY IL history this season (on IL, recent return,
+        # or any past stints). Healthy pitchers with no IL data are excluded since
+        # they don't need columns populated.
+        has_data = (
+            status.get("on_il")
+            or status.get("days_since_return") is not None
+            or (status.get("il_count_this_season") or 0) > 0
+        )
+        if has_data:
+            status["player_id"] = pid_int
+            rows.append(status)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
+# ----------------------------------------------------------------------------
+# Pitcher arsenal (pitch-mix, velo, spin, swing/miss per pitch type)
+# ----------------------------------------------------------------------------
+
+@st.cache_data(ttl=900)  # v44.60: 15min so a transient failure recovers fast
+def get_pitcher_arsenal(season: int = None) -> pd.DataFrame:
+    """
+    Returns one row per pitcher x pitch_type with: usage %, swstr%, hh%,
+    velocity, spin rate, xwOBAcon, run value per 100, etc.
+
+    v44.60 (code review #10): retries and RAISES on failure (so Streamlit
+    won't cache an empty frame) instead of a bare raise_for_status that
+    crashed callers. Use get_pitcher_arsenal_safe for a crash-proof call.
+    """
+    season = season if season is not None else current_season()  # v44.62
+    url = (
+        "https://baseballsavant.mlb.com/leaderboard/pitch-arsenal-stats"
+        f"?type=pitcher&pitchType=&year={season}&team=&min=10&hand="
+        "&csv=true"
+    )
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=30)
+            r.raise_for_status()
+            df = pd.read_csv(io.StringIO(r.text))
+            if df is not None and not df.empty:
+                if "last_name, first_name" in df.columns:
+                    df["player_name"] = df["last_name, first_name"].apply(
+                        lambda s: " ".join(reversed([p.strip() for p in str(s).split(",")]))
+                        if isinstance(s, str) and "," in s else s
+                    )
+                return df
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                import time
+                time.sleep(1.0)
+            continue
+    raise RuntimeError(f"get_pitcher_arsenal failed after retries (last error: {last_err})")
+
+
+def get_pitcher_arsenal_safe(season: int = CURRENT_SEASON) -> pd.DataFrame:
+    """Crash-proof wrapper: returns empty df instead of raising."""
+    try:
+        return get_pitcher_arsenal(season)
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600)
+def get_pitcher_arsenal_vs_hand(season: int = None,
+                                  batter_hand: str = "R") -> pd.DataFrame:
+    """
+    Pitcher arsenal split by hitter handedness.
+
+    Why this matters: pitchers throw very different mixes vs LHB vs RHB.
+    A right-handed pitcher might throw 38% sliders to RHB (slider moves
+    away from same-side hitter) but only 12% sliders to LHB. Same pitcher,
+    completely different arsenal depending on who's at the plate. RHP
+    typically throw more changeups to LHB (changeup runs away from
+    opposite-hand hitter) and more sinkers to RHB.
+
+    Without this split, we project a LHB facing a slider-heavy RHP using
+    the pitcher's OVERALL slider usage — which dramatically understates
+    the changeup he's actually going to see.
+
+    Returns a DataFrame matching get_pitcher_arsenal() schema, but with
+    only the rows where the pitcher faced batters of `batter_hand` ("L" or "R").
+    """
+    season = season if season is not None else current_season()  # v44.62
+    if batter_hand not in ("L", "R"):
+        return pd.DataFrame()
+    # v45.89: HONEST FALLBACK. After extensive testing, Savant's bulk
+    # pitch-arsenal-stats leaderboard does NOT expose a batter-side split — the
+    # split only exists on per-player pages (savant-player/{id}?stats=
+    # statcast-{r|l}-pitching), which have no bulk CSV. Rather than keep
+    # guessing parameters that return combined data mislabeled as a split, we
+    # now RETURN THE COMBINED ARSENAL EXPLICITLY and mark it as such. The
+    # combined arsenal is REAL, correct data (usage + per-pitch results across
+    # all batters) — it's simply not hand-specific. pitch_match_score can use
+    # it for a direction-agnostic matchup, and the data-health panel reports
+    # "combined (not hand-split)" so nobody mistakes it for a true platoon
+    # split. This is the "announce, don't hide" principle: a slightly-less-
+    # precise number, clearly labeled, beats a fake split or an empty frame.
+    #
+    # TODO (queued): true per-hand arsenal via per-player pages (one fetch per
+    # slate pitcher, hand token in stats=). Verified by the dup-check.
+    try:
+        combined = get_pitcher_arsenal(season=season)
+        if combined is not None and not combined.empty:
+            df = combined.copy()
+            df["vs_batter_hand"] = batter_hand
+            df.attrs["arsenal_split_url"] = "combined-arsenal (NOT hand-split)"
+            df.attrs["is_hand_split"] = False
+            return df
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600)
+def get_hitter_statcast_metrics(season: int = None, hitter_ids: tuple = (),
+                                 metrics: str = "launchSpeed,launchAngle,hitDistance,homeRunDistance") -> pd.DataFrame:
+    """v46.05: statcast METRIC AVERAGES from the RELIABLE statsapi metricAverages
+    endpoint. REQUIRES the metrics= param (errors without it). CONFIRMED-VALID
+    public metric names (verified against real Judge responses):
+      launchSpeed      → response 'launchSpeed'  (avg exit velo, 94.1 MPH)
+      launchAngle      → response 'launchAngle'  (15.0 deg)
+      hitDistance      → response 'distance'     (all-BBE avg, 195 ft)
+      homeRunDistance  → response 'hrDistance'   (avg HR distance, 404 ft!)
+    NOTE: request name != response name for the distance metrics — the parser
+    keys on the RESPONSE m['name'], so columns are sc_launchSpeed, sc_launchAngle,
+    sc_distance, sc_hrDistance.
+    GATED (NOT available — permission-denied): batSpeed, swingLength (premium
+    bat-tracking tier, requires MLB auth). Don't add them — they error the call.
+    TRACKED-ONLY. JSON: stats[0].splits[].stat.metric.{name,averageValue} + numOccurrences
+    """
+    season = season if season is not None else current_season()
+    if not hitter_ids:
+        return pd.DataFrame()
+    rows = []
+    for hid in hitter_ids:
+        try:
+            url = (f"https://statsapi.mlb.com/api/v1/people/{int(hid)}/stats"
+                   f"?stats=metricAverages&metrics={metrics}"
+                   f"&group=hitting&season={season}")
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            if r.status_code != 200:
+                continue
+            row = {"player_id": int(hid)}
+            _bbe = None
+            for sg in r.json().get("stats", []):
+                for sp in sg.get("splits", []):
+                    m = sp.get("stat", {}).get("metric", {})
+                    _name = m.get("name")
+                    _val = _saber_to_float(m.get("averageValue"))
+                    if _name and _val is not None:
+                        row[f"sc_{_name}"] = _val
+                    # v46.33 (verified vs real Judge response): take the MAX
+                    # numOccurrences across splits, not the last — hrDistance's
+                    # split reports only the HR count (17) while launchSpeed/
+                    # distance report all BBE (143-144). We want the all-BBE n.
+                    _occ = sp.get("numOccurrences")
+                    if _occ is not None:
+                        _bbe = _occ if _bbe is None else max(_bbe, _occ)
+            if _bbe is not None:
+                row["sc_bbe"] = _bbe  # batted-ball-event sample size
+            if len(row) > 1:  # got at least one metric
+                rows.append(row)
+        except Exception:
+            continue
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+@st.cache_data(ttl=3600)
+def get_pitcher_expected_stats(season: int = None, pitcher_ids: tuple = ()) -> pd.DataFrame:
+    """v46.03: pitcher expected-contact-quality-ALLOWED (xSLG/xwOBA against) from
+    RELIABLE statsapi expectedStatistics&group=pitching. Luck-stripped measure of
+    how hard a pitcher is really hit. Verified vs Misiorowski 694819 (xSLG .240,
+    xwOBA .217 allowed). TRACKED-ONLY. JSON: stats[0].splits[].stat.{slg,woba,wobaCon}
+    """
+    season = season if season is not None else current_season()
+    if not pitcher_ids:
+        return pd.DataFrame()
+    rows = []
+    for pid in pitcher_ids:
+        try:
+            url = (f"https://statsapi.mlb.com/api/v1/people/{int(pid)}/stats"
+                   f"?stats=expectedStatistics&group=pitching&season={season}")
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            if r.status_code != 200:
+                continue
+            for sg in r.json().get("stats", []):
+                for sp in sg.get("splits", []):
+                    stat = sp.get("stat", {})
+                    _xslg = _saber_to_float(stat.get("slg"))
+                    if _xslg is not None:
+                        rows.append({
+                            "player_id": int(pid),
+                            "p_x_slg_allowed": _xslg,
+                            "p_x_woba_allowed": _saber_to_float(stat.get("woba")),
+                        })
+                        break
+        except Exception:
+            continue
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+@st.cache_data(ttl=3600)
+def get_hitter_spray(season: int = None, hitter_ids: tuple = ()) -> pd.DataFrame:
+    """v46.03: spray-chart pull tendency from RELIABLE statsapi sprayChart. Returns
+    a pull_pct_spray = share of batted balls to the PULL side. NOTE: pull side
+    depends on handedness — for RHB pull=LF+LCF, for LHB pull=RF+RCF. Verified vs
+    Judge (RHB): LF 36 + LCF 43 of 100 = heavy pull. Needs bat side to orient, so
+    caller passes hitter_bats. TRACKED-ONLY.
+    JSON: stats[0].splits[].stat.{leftField,leftCenterField,centerField,
+    rightCenterField,rightField}
+    """
+    season = season if season is not None else current_season()
+    if not hitter_ids:
+        return pd.DataFrame()
+    rows = []
+    for hid in hitter_ids:
+        try:
+            url = (f"https://statsapi.mlb.com/api/v1/people/{int(hid)}/stats"
+                   f"?stats=sprayChart&group=hitting&season={season}")
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            if r.status_code != 200:
+                continue
+            for sg in r.json().get("stats", []):
+                for sp in sg.get("splits", []):
+                    stat = sp.get("stat", {})
+                    _lf = _saber_to_float(stat.get("leftField")) or 0.0
+                    _lcf = _saber_to_float(stat.get("leftCenterField")) or 0.0
+                    _cf = _saber_to_float(stat.get("centerField")) or 0.0
+                    _rcf = _saber_to_float(stat.get("rightCenterField")) or 0.0
+                    _rf = _saber_to_float(stat.get("rightField")) or 0.0
+                    _tot = _lf + _lcf + _cf + _rcf + _rf
+                    if _tot > 0:
+                        # store raw side shares; caller orients by bat hand.
+                        # "left_side_pct" = LF+LCF share (pull for RHB, oppo LHB)
+                        rows.append({
+                            "player_id": int(hid),
+                            "left_side_pct": round(100.0 * (_lf + _lcf) / _tot, 1),
+                            "right_side_pct": round(100.0 * (_rcf + _rf) / _tot, 1),
+                            "center_pct": round(100.0 * _cf / _tot, 1),
+                        })
+                        break
+        except Exception:
+            continue
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+@st.cache_data(ttl=3600)
+def get_hitter_sabermetrics(season: int = None, hitter_ids: tuple = ()) -> pd.DataFrame:
+    """v46.02: wRC+ and advanced offensive rate stats from RELIABLE statsapi
+    sabermetrics endpoint. wRC+ = gold-standard park/league-adjusted offense
+    (100 avg, 150 = 50% better). Verified vs Judge 592450 (wRcPlus 150.8).
+    TRACKED-ONLY. JSON: stats[0].splits[].stat.{wRcPlus, woba, wRaa}
+    """
+    season = season if season is not None else current_season()
+    if not hitter_ids:
+        return pd.DataFrame()
+    rows = []
+    for hid in hitter_ids:
+        try:
+            url = (f"https://statsapi.mlb.com/api/v1/people/{int(hid)}/stats"
+                   f"?stats=sabermetrics&group=hitting&season={season}")
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            if r.status_code != 200:
+                continue
+            for sg in r.json().get("stats", []):
+                for sp in sg.get("splits", []):
+                    stat = sp.get("stat", {})
+                    if "wRcPlus" in stat:
+                        rows.append({
+                            "player_id": int(hid),
+                            "wrc_plus": _saber_to_float(stat.get("wRcPlus")),
+                            "woba_saber": _saber_to_float(stat.get("woba")),
+                            "wraa": _saber_to_float(stat.get("wRaa")),
+                        })
+                        break
+        except Exception:
+            continue
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+@st.cache_data(ttl=3600)
+def get_hitter_expected_stats(season: int = None, hitter_ids: tuple = ()) -> pd.DataFrame:
+    """v46.02: expected stats (xSLG, xwOBA, xwOBA-on-contact) from RELIABLE
+    statsapi expectedStatistics. wobaCon (wOBA on contact) strips walks/Ks =
+    pure contact quality (newest signal). Verified vs Judge (xSLG .600, wobaCon
+    .546). TRACKED-ONLY. JSON: stats[0].splits[].stat.{slg,woba,wobaCon}
+    """
+    season = season if season is not None else current_season()
+    if not hitter_ids:
+        return pd.DataFrame()
+    rows = []
+    for hid in hitter_ids:
+        try:
+            url = (f"https://statsapi.mlb.com/api/v1/people/{int(hid)}/stats"
+                   f"?stats=expectedStatistics&group=hitting&season={season}")
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            if r.status_code != 200:
+                continue
+            for sg in r.json().get("stats", []):
+                for sp in sg.get("splits", []):
+                    stat = sp.get("stat", {})
+                    _xslg = _saber_to_float(stat.get("slg"))
+                    if _xslg is not None:
+                        rows.append({
+                            "player_id": int(hid),
+                            "x_slg_saber": _xslg,
+                            "x_woba_con": _saber_to_float(stat.get("wobaCon")),
+                        })
+                        break
+        except Exception:
+            continue
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+# v46.38: precomputed historical data lives in this file (built once per season
+# by build_historical_data.py). Loading from it is INSTANT — no API calls at
+# render. The live get_hitter_historical_* fetchers below are FALLBACKS only.
+import json as _json
+import os as _os
+
+_HISTORICAL_FILE = _os.path.join(
+    _os.path.dirname(_os.path.abspath(__file__)), "historical_data.json")
+
+
+@st.cache_data(ttl=86400)
+def load_precomputed_historical() -> dict:
+    """Load the precomputed historical data file (priors + splits per player_id).
+    Returns {} if the file is missing (app then runs without historical context,
+    or the user can enable the slow live-fetch fallback). INSTANT — reads one
+    local file, no network."""
+    try:
+        if _os.path.exists(_HISTORICAL_FILE):
+            with open(_HISTORICAL_FILE, "r") as f:
+                data = _json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def historical_frame_for(hitter_ids: tuple, kind: str = "priors") -> pd.DataFrame:
+    """Build a DataFrame of precomputed historical `kind` ('priors' or 'splits')
+    for the given hitter_ids, from the local file. INSTANT. Empty if no file."""
+    data = load_precomputed_historical()
+    if not data:
+        return pd.DataFrame()
+    section = data.get(kind, {})
+    if not section:
+        return pd.DataFrame()
+    rows = []
+    for hid in hitter_ids:
+        rec = section.get(str(int(hid))) if str(hid).lstrip("-").isdigit() else None
+        if rec:
+            row = {"player_id": int(hid)}
+            row.update(rec)
+            rows.append(row)
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+@st.cache_data(ttl=86400)  # 24h — prior-SEASON data is static, cache hard
+def get_hitter_historical_priors(hitter_ids: tuple = (),
+                                 current_year: int = None,
+                                 years_back: int = 3) -> pd.DataFrame:
+    """v46.36: 3-year historical POWER PRIORS per hitter (tracked-only context,
+    NOT blended into current-season signal). For each hitter, pull the prior
+    `years_back` completed seasons' power stats (barrel/ISO/xSLG/xwOBA/EV via
+    expectedStatistics + statcast), and summarise into a STABILITY PRIOR:
+      - hist_seasons: how many of the last N seasons had qualifying data
+      - hist_iso / hist_xslg / hist_xwoba / hist_ev: multi-year AVERAGE
+      - hist_power_backing: 0-1 score = how strongly a hitter's HISTORY says
+        the power is real (used later ONLY as a confidence prior on how much to
+        trust a cold/hot CURRENT sample — never mixed into the live metric).
+    Columns are all `hist_`-prefixed so they can NEVER collide with or
+    contaminate current-season columns the FDR pattern loop grades.
+
+    DISCIPLINE: this is a PRIOR on trustworthiness, kept fully separate from the
+    measured current-season signal. Enters tracked-only; must prove it predicts
+    HRs via the pattern loop before it earns any scoring role.
+    """
+    if not hitter_ids:
+        return pd.DataFrame()
+    cy = current_year if current_year is not None else current_season()
+    seasons = [cy - k for k in range(1, years_back + 1)]  # prior N completed yrs
+    rows = []
+    for hid in hitter_ids:
+        try:
+            _hid = int(hid)
+        except (TypeError, ValueError):
+            continue
+        per_season = []
+        for yr in seasons:
+            s = {}
+            # expected stats (xSLG / xwOBA) for the season
+            try:
+                u = (f"https://statsapi.mlb.com/api/v1/people/{_hid}/stats"
+                     f"?stats=expectedStatistics&group=hitting&season={yr}")
+                r = requests.get(u, headers=HEADERS, timeout=15)
+                if r.status_code == 200:
+                    for sg in r.json().get("stats", []):
+                        for sp in sg.get("splits", []):
+                            st_ = sp.get("stat", {})
+                            s["xslg"] = _saber_to_float(st_.get("slg"))
+                            s["xwoba"] = _saber_to_float(st_.get("woba"))
+                            s["xwoba_con"] = _saber_to_float(st_.get("wobaCon"))
+                            break
+            except Exception:
+                pass
+            # season ISO (from the regular hitting split: slg - avg)
+            try:
+                u2 = (f"https://statsapi.mlb.com/api/v1/people/{_hid}/stats"
+                      f"?stats=season&group=hitting&season={yr}")
+                r2 = requests.get(u2, headers=HEADERS, timeout=15)
+                if r2.status_code == 200:
+                    for sg in r2.json().get("stats", []):
+                        for sp in sg.get("splits", []):
+                            st_ = sp.get("stat", {})
+                            _slg = _saber_to_float(st_.get("slg"))
+                            _avg = _saber_to_float(st_.get("avg"))
+                            _pa = _saber_to_float(st_.get("plateAppearances"))
+                            if _slg is not None and _avg is not None:
+                                s["iso"] = round(_slg - _avg, 3)
+                            s["pa"] = _pa
+                            break
+            except Exception:
+                pass
+            # statcast EV for the season (metricAverages)
+            try:
+                u3 = (f"https://statsapi.mlb.com/api/v1/people/{_hid}/stats"
+                      f"?stats=metricAverages&metrics=launchSpeed&group=hitting&season={yr}")
+                r3 = requests.get(u3, headers=HEADERS, timeout=15)
+                if r3.status_code == 200:
+                    for sg in r3.json().get("stats", []):
+                        for sp in sg.get("splits", []):
+                            m = sp.get("stat", {}).get("metric", {})
+                            if m.get("name") == "launchSpeed":
+                                s["ev"] = _saber_to_float(m.get("averageValue"))
+                            break
+            except Exception:
+                pass
+            # only count a season if it had a real sample (>= 100 PA) + some data
+            if s.get("pa") and s["pa"] >= 100 and any(
+                    s.get(k) is not None for k in ("iso", "xslg", "xwoba", "ev")):
+                per_season.append(s)
+
+        if not per_season:
+            # no qualifying history — record an explicit "unproven" row so the
+            # downstream prior can distinguish "no history" from "not fetched"
+            rows.append({"player_id": _hid, "hist_seasons": 0,
+                         "hist_power_backing": 0.0})
+            continue
+
+        def _avg(key):
+            vals = [x[key] for x in per_season if x.get(key) is not None]
+            return round(sum(vals) / len(vals), 3) if vals else None
+
+        h_iso = _avg("iso"); h_xslg = _avg("xslg")
+        h_xwoba = _avg("xwoba"); h_ev = _avg("ev")
+        # power-backing prior (0-1): how strongly history says the power is real.
+        # Uses elite thresholds consistent with the rest of the app
+        # (iso .230, xslg .450, ev 91). Averaged across whichever are present,
+        # then scaled by how many seasons of evidence we have.
+        _components = []
+        if h_iso is not None:   _components.append(min(1.0, h_iso / 0.250))
+        if h_xslg is not None:  _components.append(min(1.0, h_xslg / 0.480))
+        if h_xwoba is not None: _components.append(min(1.0, h_xwoba / 0.360))
+        if h_ev is not None:    _components.append(min(1.0, max(0.0, (h_ev - 85.0) / 10.0)))
+        _base = sum(_components) / len(_components) if _components else 0.0
+        _season_conf = len(per_season) / float(years_back)  # 1.0 if full history
+        rows.append({
+            "player_id": _hid,
+            "hist_seasons": len(per_season),
+            "hist_iso": h_iso,
+            "hist_xslg": h_xslg,
+            "hist_xwoba": h_xwoba,
+            "hist_ev": h_ev,
+            "hist_power_backing": round(_base * (0.6 + 0.4 * _season_conf), 3),
+        })
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+def _split_power(stat: dict) -> dict:
+    """Extract power stats (ISO, SLG, HR-rate, PA) from a statSplits stat block.
+    ISO = slg - avg. Returns {} if no usable data."""
+    out = {}
+    _slg = _saber_to_float(stat.get("slg"))
+    _avg = _saber_to_float(stat.get("avg"))
+    _pa = _saber_to_float(stat.get("plateAppearances"))
+    _hr = _saber_to_float(stat.get("homeRuns"))
+    if _slg is not None and _avg is not None:
+        out["iso"] = round(_slg - _avg, 3)
+    if _slg is not None:
+        out["slg"] = _slg
+    if _pa is not None:
+        out["pa"] = _pa
+    if _hr is not None and _pa and _pa > 0:
+        out["hr_rate"] = round(_hr / _pa, 4)
+    return out
+
+
+@st.cache_data(ttl=86400)  # 24h — prior-season split data is static
+def get_hitter_historical_splits(hitter_ids: tuple = (),
+                                 current_year: int = None,
+                                 years_back: int = 3,
+                                 current_month: int = None) -> pd.DataFrame:
+    """v46.38: 3-year HISTORICAL SPLIT priors — platoon (vs LHP/RHP), day/night,
+    and current-month — built ONLY where the sample stays large enough to be
+    signal not noise. All tracked-only, hist_-prefixed, never blended into
+    current-season signal.
+
+    Coarse buckets on purpose (every slice shrinks the sample):
+      - PLATOON (vl/vr): 2 buckets, big samples → predictive. Verified endpoint.
+      - DAY/NIGHT (d/n): 2 buckets, moderate sample.
+      - CURRENT MONTH: 1 bucket = how this hitter historically hit in tonight's
+        calendar month (slow-starter / late-bloomer signal), not 12 thin months.
+    Platoon is established signal; day/night + month are tracked so the FDR loop
+    can judge honestly. Sample-gated (platoon>=150 PA, day/night>=100, month>=60)
+    so a thin slice is dropped, not trusted."""
+    if not hitter_ids:
+        return pd.DataFrame()
+    cy = current_year if current_year is not None else current_season()
+    mo = current_month if current_month is not None else datetime.now().month
+    seasons = [cy - k for k in range(1, years_back + 1)]
+
+    rows = []
+    for hid in hitter_ids:
+        try:
+            _hid = int(hid)
+        except (TypeError, ValueError):
+            continue
+        acc = {"vl": [], "vr": [], "d": [], "n": [], "month": []}
+        for yr in seasons:
+            for sit, keys in (("vl,vr", ("vl", "vr")), ("d,n", ("d", "n"))):
+                try:
+                    u = (f"https://statsapi.mlb.com/api/v1/people/{_hid}/stats"
+                         f"?stats=statSplits&sitCodes={sit}&group=hitting&season={yr}")
+                    r = requests.get(u, headers=HEADERS, timeout=15)
+                    if r.status_code != 200:
+                        continue
+                    for sg in r.json().get("stats", []):
+                        for sp in sg.get("splits", []):
+                            code = sp.get("split", {}).get("code", "")
+                            if code in keys:
+                                p = _split_power(sp.get("stat", {}))
+                                if p:
+                                    acc[code].append(p)
+                except Exception:
+                    continue
+            try:
+                u2 = (f"https://statsapi.mlb.com/api/v1/people/{_hid}/stats"
+                      f"?stats=byMonth&group=hitting&season={yr}")
+                r2 = requests.get(u2, headers=HEADERS, timeout=15)
+                if r2.status_code == 200:
+                    for sg in r2.json().get("stats", []):
+                        for sp in sg.get("splits", []):
+                            _m = (sp.get("month")
+                                  or sp.get("split", {}).get("month")
+                                  or sp.get("stat", {}).get("month"))
+                            if _m is not None and int(_m) == mo:
+                                p = _split_power(sp.get("stat", {}))
+                                if p:
+                                    acc["month"].append(p)
+            except Exception:
+                pass
+
+        def _pa_weighted(bucket, key, min_pa):
+            recs = [x for x in acc[bucket] if x.get(key) is not None and x.get("pa")]
+            tot_pa = sum(x["pa"] for x in recs)
+            if tot_pa < min_pa or not recs:
+                return None, tot_pa
+            val = sum(x[key] * x["pa"] for x in recs) / tot_pa
+            return round(val, 3), tot_pa
+
+        row = {"player_id": _hid}
+        vl_iso, _ = _pa_weighted("vl", "iso", 150)
+        vr_iso, _ = _pa_weighted("vr", "iso", 150)
+        d_iso, _ = _pa_weighted("d", "iso", 100)
+        n_iso, _ = _pa_weighted("n", "iso", 100)
+        m_iso, m_pa = _pa_weighted("month", "iso", 60)
+        m_hr, _ = _pa_weighted("month", "hr_rate", 60)
+        if vl_iso is not None:
+            row["hist_vs_lhp_iso"] = vl_iso
+        if vr_iso is not None:
+            row["hist_vs_rhp_iso"] = vr_iso
+        if vl_iso is not None and vr_iso is not None:
+            row["hist_platoon_gap"] = round(vl_iso - vr_iso, 3)
+        if d_iso is not None:
+            row["hist_day_iso"] = d_iso
+        if n_iso is not None:
+            row["hist_night_iso"] = n_iso
+        if d_iso is not None and n_iso is not None:
+            row["hist_daynight_gap"] = round(d_iso - n_iso, 3)
+        if m_iso is not None:
+            row["hist_month_iso"] = m_iso
+            row["hist_month_sample"] = int(m_pa)
+        if m_hr is not None:
+            row["hist_month_hr_rate"] = m_hr
+        if len(row) > 1:
+            rows.append(row)
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+@st.cache_data(ttl=3600)
+def get_hitter_hot_zones(season: int = None, hitter_ids: tuple = ()) -> pd.DataFrame:
+    """v45.93: per-zone hitter performance from the RELIABLE statsapi
+    hotColdZones endpoint — replaces the broken Savant zone fetch AND adds new
+    signal. Returns derived per-hitter summary features:
+      hot_zone_slg   — best (max) zone SLG (where the hitter does most damage)
+      heart_zone_slg — avg SLG in middle zones (04,05,06 — meatball zones)
+      chase_zone_slg — avg SLG in shadow zones (11-14 — expanded/chase)
+      zone_slg_spread — max-min zone SLG (how zone-dependent the hitter is)
+      hot_zone_ev    — best zone exit velocity
+    JSON shape (verified w/ Judge 592450): stats[0].splits[] one per stat name;
+    each .zones[] has zone/temp/value. Reliable statsapi source. NOTE: derived
+    features start TRACKED-ONLY — not wired to scoring until the pattern loop
+    proves they predict HRs.
+    """
+    season = season if season is not None else current_season()
+    if not hitter_ids:
+        return pd.DataFrame()
+    HEART = {"04", "05", "06"}
+    CHASE = {"11", "12", "13", "14"}
+    rows = []
+    for hid in hitter_ids:
+        try:
+            url = (
+                f"https://statsapi.mlb.com/api/v1/people/{int(hid)}/stats"
+                f"?stats=hotColdZones&group=hitting&season={season}"
+            )
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            slg_by_zone = {}
+            ev_by_zone = {}
+            for stat_group in data.get("stats", []):
+                for split in stat_group.get("splits", []):
+                    stat = split.get("stat", {})
+                    name = stat.get("name", "")
+                    for z in stat.get("zones", []):
+                        zc = z.get("zone", "")
+                        try:
+                            val = float(z.get("value"))
+                        except (TypeError, ValueError):
+                            continue
+                        if name == "sluggingPercentage":
+                            slg_by_zone[zc] = val
+                        elif name == "exitVelocity":
+                            ev_by_zone[zc] = val
+            if not slg_by_zone:
+                continue
+            _all = list(slg_by_zone.values())
+            _heart = [slg_by_zone[z] for z in HEART if z in slg_by_zone]
+            _chase = [slg_by_zone[z] for z in CHASE if z in slg_by_zone]
+            rows.append({
+                "player_id": int(hid),
+                "hot_zone_slg": round(max(_all), 3) if _all else None,
+                "heart_zone_slg": round(sum(_heart) / len(_heart), 3) if _heart else None,
+                "chase_zone_slg": round(sum(_chase) / len(_chase), 3) if _chase else None,
+                "zone_slg_spread": round(max(_all) - min(_all), 3) if _all else None,
+                "hot_zone_ev": round(max(ev_by_zone.values()), 1) if ev_by_zone else None,
+            })
+        except Exception:
+            continue
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+@st.cache_data(ttl=3600)
+def get_pitcher_hand_matchup(season: int = None,
+                              pitcher_ids: tuple = ()) -> pd.DataFrame:
+    """v45.92: TRUE per-hand pitcher matchup, combining two RELIABLE sources —
+    since no bulk endpoint gives per-pitch results by batter hand (confirmed
+    exhaustively), we combine what DOES work:
+      1. get_pitcher_arsenal → the pitch MIX (hand-agnostic usage % per pitch)
+      2. get_pitcher_handedness_splits → the RESULTS vs L / vs R (slg, hr_per_pa,
+         k%, from statsapi statSplits — proven real, works at 100%)
+
+    Output: one row per pitcher with the arsenal summary PLUS genuine vs-LHB and
+    vs-RHB result columns (vs_lhb_slg, vs_lhb_hr_per_pa, vs_rhb_slg, ...). This
+    is a REAL hand split — how hittable the pitcher is by batter side — even
+    though the per-PITCH breakdown stays combined. Strictly better than the
+    direction-agnostic arsenal for matchup scoring.
+
+    Returns empty df if either source is unavailable (caller degrades honestly).
+    """
+    season = season if season is not None else current_season()
+    if not pitcher_ids:
+        return pd.DataFrame()
+    try:
+        # RESULTS by hand (the real split)
+        hand = get_pitcher_handedness_splits(
+            season=season, pitcher_ids=tuple(pitcher_ids))
+        if hand is None or hand.empty or "player_id" not in hand.columns:
+            return pd.DataFrame()
+        # MIX (hand-agnostic) — summarize each pitcher's dominant pitches
+        arsenal = get_pitcher_arsenal_safe(season=season)
+        mix_rows = []
+        if arsenal is not None and not arsenal.empty and "player_id" in arsenal.columns:
+            _use_col = next((c for c in ("pitch_usage", "pitch_percent", "pitches")
+                             if c in arsenal.columns), None)
+            for pid, grp in arsenal.groupby("player_id"):
+                row = {"player_id": pid}
+                if _use_col and "pitch_type" in grp.columns:
+                    g2 = grp.sort_values(_use_col, ascending=False)
+                    row["primary_pitch"] = g2["pitch_type"].iloc[0]
+                    row["n_pitches_thrown"] = int(len(grp))
+                mix_rows.append(row)
+        mix = pd.DataFrame(mix_rows) if mix_rows else pd.DataFrame(
+            columns=["player_id"])
+        # combine: hand results are the spine, mix summary joined on
+        out = hand.merge(mix, on="player_id", how="left") if not mix.empty else hand
+        out.attrs["is_hand_split"] = True
+        out.attrs["source"] = "statsapi statSplits(vl,vr) + arsenal mix"
+        return out
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=1800)
+def get_pitcher_full_season_from_gamelog(pitcher_id: int,
+                                            season: int = CURRENT_SEASON) -> dict:
+    """
+    Compute season-total ERA/WHIP/K9/BB9/HR9/IP/GS by summing the pitcher's
+    own game log. This is independent of the /api/v1/stats?stats=season endpoint
+    that's been flaky. Same /people/{id}/stats?stats=gameLog endpoint that
+    powers recent form -- known to work.
+    """
+    url = (
+        f"https://statsapi.mlb.com/api/v1/people/{pitcher_id}/stats"
+        f"?stats=gameLog&group=pitching&season={season}&sportId=1"
+    )
+    splits = []
+    for attempt in range(2):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=12)
+            r.raise_for_status()
+            splits = r.json().get("stats", [{}])[0].get("splits", [])
+            if splits:
+                break
+        except Exception:
+            if attempt < 1:
+                import time
+                time.sleep(0.5)
+            continue
+    if not splits:
+        return {}
+    ip_sum, er_sum, k_sum, bb_sum, hr_sum = 0.0, 0, 0, 0, 0
+    h_sum = 0
+    gs_sum = 0
+    gp_sum = 0
+    for s in splits:
+        st_ = s.get("stat", {}) or {}
+        ip_sum += _safe_ip(st_.get("inningsPitched")) or 0  # v46.07: thirds-aware
+        er_sum += _safe_int(st_.get("earnedRuns")) or 0
+        k_sum += _safe_int(st_.get("strikeOuts")) or 0
+        bb_sum += _safe_int(st_.get("baseOnBalls")) or 0
+        hr_sum += _safe_int(st_.get("homeRuns")) or 0
+        h_sum += _safe_int(st_.get("hits")) or 0
+        gs_sum += _safe_int(st_.get("gamesStarted")) or 0
+        gp_sum += _safe_int(st_.get("gamesPlayed")) or 0
+    if ip_sum == 0:
+        return {}
+    # WHIP = (BB + H) / IP
+    whip = round((bb_sum + h_sum) / ip_sum, 2) if ip_sum > 0 else None
+    return {
+        "era": round(er_sum * 9 / ip_sum, 2),
+        "whip": whip,
+        "k9": round(k_sum * 9 / ip_sum, 2),
+        "bb9": round(bb_sum * 9 / ip_sum, 2),
+        "hr9": round(hr_sum * 9 / ip_sum, 2),
+        "ip": round(ip_sum, 1),
+        "games_started": gs_sum,
+        "games_played": gp_sum,
+        "strikeouts": k_sum,
+        "walks": bb_sum,
+        "earned_runs": er_sum,
+        "source": "gamelog",  # marker so we know which source
+    }
+
+
+@st.cache_data(ttl=1800)
+def get_pitcher_recent_form(pitcher_id: int, season: int = CURRENT_SEASON,
+                              n_starts: int = 5) -> dict:
+    """
+    Recent form: last N starts K/9, ERA, IP.
+    Returns trending up/down arrow.
+    """
+    url = (
+        f"https://statsapi.mlb.com/api/v1/people/{pitcher_id}/stats"
+        f"?stats=gameLog&group=pitching&season={season}&sportId=1"
+    )
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        r.raise_for_status()
+        splits = r.json().get("stats", [{}])[0].get("splits", [])
+        if not splits:
+            return {}
+        # Last N starts only
+        starts = [s for s in splits if int(s.get("stat", {}).get("gamesStarted", 0)) > 0]
+        recent = starts[-n_starts:] if len(starts) > n_starts else starts
+        if not recent:
+            return {}
+        ip_sum, er_sum, k_sum, bb_sum, hr_sum = 0.0, 0, 0, 0, 0
+        for s in recent:
+            st_ = s.get("stat", {})
+            ip_sum += _safe_ip(st_.get("inningsPitched", 0)) or 0  # v46.07: thirds-aware
+            er_sum += int(st_.get("earnedRuns", 0) or 0)
+            k_sum += int(st_.get("strikeOuts", 0) or 0)
+            bb_sum += int(st_.get("baseOnBalls", 0) or 0)
+            hr_sum += int(st_.get("homeRuns", 0) or 0)
+        if ip_sum == 0:
+            return {}
+        return {
+            "recent_starts": len(recent),
+            "recent_ip": round(ip_sum, 1),
+            "recent_era": round(er_sum * 9 / ip_sum, 2),
+            "recent_k9": round(k_sum * 9 / ip_sum, 2),
+            "recent_bb9": round(bb_sum * 9 / ip_sum, 2),
+            "recent_hr9": round(hr_sum * 9 / ip_sum, 2),
+            "recent_k": k_sum,
+        }
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=1800)
+def get_hitter_recent_form_trad(player_id: int, season: int = CURRENT_SEASON,
+                                  n_games: int = 15,
+                                  _cache_version: str = "v3") -> dict:
+    """Last 15 games hitter form via game log - lightweight.
+
+    Now also tracks HR streaks and hot/cold pattern indicators.
+
+    _cache_version: bumped to v3 for v42c when 10-game window stats were
+    added (recent_iso_10, recent_avg_10, etc). Forces Streamlit cache to
+    invalidate so old cached results don't override fresh fetches.
+    """
+    url = (
+        f"https://statsapi.mlb.com/api/v1/people/{player_id}/stats"
+        f"?stats=gameLog&group=hitting&season={season}&sportId=1"
+    )
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        r.raise_for_status()
+        splits = r.json().get("stats", [{}])[0].get("splits", [])
+        recent = splits[-n_games:] if len(splits) > n_games else splits
+        if not recent:
+            return {}
+        ab, h, hr, k, bb, rbi = 0, 0, 0, 0, 0, 0
+        d, t = 0, 0
+        # Streak tracking - per-game HR list (most recent first)
+        per_game_hr = []
+        per_game_hits = []
+        for s in recent:
+            st_ = s.get("stat", {})
+            ab += int(st_.get("atBats", 0) or 0)
+            h += int(st_.get("hits", 0) or 0)
+            game_hr = int(st_.get("homeRuns", 0) or 0)
+            hr += game_hr
+            per_game_hr.append(game_hr)
+            per_game_hits.append(int(st_.get("hits", 0) or 0))
+            k += int(st_.get("strikeOuts", 0) or 0)
+            bb += int(st_.get("baseOnBalls", 0) or 0)
+            rbi += int(st_.get("rbi", 0) or 0)
+            d += int(st_.get("doubles", 0) or 0)
+            t += int(st_.get("triples", 0) or 0)
+        if ab == 0:
+            return {}
+
+        # v42c: Also compute last-10 stats for "ideal window" recent form
+        # (community consensus: 10 days = signal sweet spot, 5 too noisy,
+        # 15 too smoothed). The 15-game stats above stay for backward
+        # compatibility and longer-window context; 10-game stats added below
+        # for ranking sensitivity.
+        last_10_splits = recent[-10:] if len(recent) > 10 else recent
+        ab_10, h_10, hr_10, d_10, t_10, k_10, bb_10 = 0, 0, 0, 0, 0, 0, 0
+        for s10 in last_10_splits:
+            st10 = s10.get("stat", {})
+            ab_10 += int(st10.get("atBats", 0) or 0)
+            h_10 += int(st10.get("hits", 0) or 0)
+            hr_10 += int(st10.get("homeRuns", 0) or 0)
+            d_10 += int(st10.get("doubles", 0) or 0)
+            t_10 += int(st10.get("triples", 0) or 0)
+            k_10 += int(st10.get("strikeOuts", 0) or 0)
+            bb_10 += int(st10.get("baseOnBalls", 0) or 0)
+        # ISO over 10 games
+        recent_iso_10 = round((d_10 + 2 * t_10 + 3 * hr_10) / ab_10, 3) if ab_10 else 0.0
+        # AVG over 10
+        recent_avg_10 = round(h_10 / ab_10, 3) if ab_10 else 0.0
+        # K% over 10
+        recent_k_pct_10 = round(k_10 / (ab_10 + bb_10) * 100, 1) if (ab_10 + bb_10) else 0.0
+
+        # v42t: 5-game window — captures very recent hot/cold streaks.
+        # User-requested signal: "hitting the ball hard and in the air over
+        # past 5 games to determine if HR form is better/worse than baseline."
+        # ISO captures extra-base output (the cleanest power proxy from MLB
+        # Stats API game logs — Savant batted-ball stats aren't game-by-game).
+        # SLG captures total bases per AB, similar but includes singles.
+        # 5-game window is noisy (1 multi-HR game = huge swing) but is
+        # exactly what the user wants for catching hot streaks early.
+        last_5_splits = recent[-5:] if len(recent) > 5 else recent
+        ab_5, h_5, hr_5, d_5, t_5, k_5, bb_5 = 0, 0, 0, 0, 0, 0, 0
+        for s5 in last_5_splits:
+            st5 = s5.get("stat", {})
+            ab_5 += int(st5.get("atBats", 0) or 0)
+            h_5 += int(st5.get("hits", 0) or 0)
+            hr_5 += int(st5.get("homeRuns", 0) or 0)
+            d_5 += int(st5.get("doubles", 0) or 0)
+            t_5 += int(st5.get("triples", 0) or 0)
+            k_5 += int(st5.get("strikeOuts", 0) or 0)
+            bb_5 += int(st5.get("baseOnBalls", 0) or 0)
+        # ISO over 5 games
+        recent_iso_5 = round((d_5 + 2 * t_5 + 3 * hr_5) / ab_5, 3) if ab_5 else 0.0
+        # SLG over 5 games (total bases / AB)
+        tb_5 = h_5 + d_5 + 2 * t_5 + 3 * hr_5  # total bases
+        recent_slg_5 = round(tb_5 / ab_5, 3) if ab_5 else 0.0
+        # AVG over 5 (less HR-relevant but useful for display)
+        recent_avg_5 = round(h_5 / ab_5, 3) if ab_5 else 0.0
+
+        # Streak metrics - reverse so most-recent game is first
+        per_game_hr_rev = list(reversed(per_game_hr))
+        # Count games since last HR (None = never homered in window)
+        games_since_hr = None
+        for i, ghr in enumerate(per_game_hr_rev):
+            if ghr > 0:
+                games_since_hr = i
+                break
+        # Consecutive games with a HR (streak)
+        consec_hr_games = 0
+        for ghr in per_game_hr_rev:
+            if ghr > 0:
+                consec_hr_games += 1
+            else:
+                break
+        # HRs in last 5, last 10 (rolling windows)
+        hr_last_5 = sum(per_game_hr_rev[:5])
+        hr_last_10 = sum(per_game_hr_rev[:10])
+        # Multi-HR games in window
+        multi_hr_games = sum(1 for ghr in per_game_hr if ghr >= 2)
+
+        # NEW: RECENCY-WEIGHTED recent_hr metric
+        # Last 3 games weighted 3x; games 4-7 weighted 2x; games 8-15 weighted 1x.
+        # Captures hot streaks more accurately than equal-weight rolling sum.
+        # Returns a "weighted HR rate" — equivalent HRs assuming the recent
+        # weighting pattern continues. Useful for picking up real momentum.
+        weighted_hr = 0.0
+        weighted_pa = 0.0
+        for i, ghr in enumerate(per_game_hr_rev):
+            # Per-game PA estimate from AB+BB (close enough for weighting)
+            this_ab = int(recent[len(recent) - 1 - i].get("stat", {}).get("atBats", 0) or 0)
+            this_bb = int(recent[len(recent) - 1 - i].get("stat", {}).get("baseOnBalls", 0) or 0)
+            game_pa = this_ab + this_bb
+            if i < 3:    weight = 3.0   # last 3 games
+            elif i < 7:  weight = 2.0   # games 4-7
+            else:        weight = 1.0   # games 8-15
+            weighted_hr += ghr * weight
+            weighted_pa += game_pa * weight
+        recent_hr_weighted_rate = (
+            round(weighted_hr / weighted_pa * 100, 3)
+            if weighted_pa > 0 else 0.0
+        )
+
+        # Streak label for the table
+        if consec_hr_games >= 2:
+            streak_label = f"🔥 {consec_hr_games}g HR streak"
+        elif hr_last_5 >= 3:
+            streak_label = f"🔥 {hr_last_5} HR/L5"
+        elif hr_last_5 >= 2:
+            streak_label = f"🌶️ {hr_last_5} HR/L5"
+        elif multi_hr_games >= 1:
+            streak_label = f"⚡ {multi_hr_games}x multi-HR/L{len(recent)}"
+        elif hr_last_10 == 0 and len(recent) >= 10:
+            streak_label = "❄️ no HR L10"
+        else:
+            streak_label = ""
+
+        return {
+            "recent_games": len(recent),
+            "recent_ab": ab, "recent_h": h, "recent_hr": hr,
+            "recent_k": k, "recent_bb": bb, "recent_rbi": rbi,
+            "recent_avg": round(h / ab, 3),
+            "recent_iso": round((d + 2 * t + 3 * hr) / ab, 3) if ab else 0.0,
+            "recent_k_pct": round(k / (ab + bb) * 100, 1) if (ab + bb) else 0.0,
+            # v46.07 (review): this is (H+BB)/(AB+BB) — a pseudo-OBP, NOT OPS
+            # (no SLG term). Renamed to reflect what it measures. Unused
+            # downstream, so the rename is safe.
+            "recent_obp_proxy": round((h + bb) / (ab + bb), 3) if (ab + bb) else 0.0,
+            "hr_streak_games": consec_hr_games,
+            "recent_hr_weighted_rate": recent_hr_weighted_rate,
+            "games_since_hr": games_since_hr,
+            "hr_last_5": hr_last_5,
+            "hr_last_10": hr_last_10,
+            # v42c: 10-game window — community-validated as ideal HR signal
+            "recent_iso_10": recent_iso_10,
+            "recent_avg_10": recent_avg_10,
+            "recent_k_pct_10": recent_k_pct_10,
+            "recent_ab_10": ab_10,
+            "recent_h_10": h_10,
+            "recent_hr_10": hr_10,
+            # v42t: 5-game window — user-requested for catching hot streaks
+            # earlier than the 10-game signal. Display-only (does NOT feed
+            # into hr_form scoring — that would be re-weighting a calibration
+            # we have +25.9pp evidence is working). Useful for the user to
+            # visually identify trending hitters.
+            "recent_iso_5": recent_iso_5,
+            "recent_slg_5": recent_slg_5,
+            "recent_avg_5": recent_avg_5,
+            "recent_hr_5": hr_5,
+            "recent_ab_5": ab_5,
+            "multi_hr_games": multi_hr_games,
+            "streak_label": streak_label,
+        }
+    except Exception:
+        return {}
+
+
+# ----------------------------------------------------------------------------
+# Sprint Speed (affects BABIP and infield hits) - Statcast
+# ----------------------------------------------------------------------------
+
+@st.cache_data(ttl=86400)
+def get_sprint_speed(season: int = CURRENT_SEASON) -> pd.DataFrame:
+    """
+    Statcast sprint speed leaderboard. ft/sec, league avg ~27.
+    Elite is 30+. Slow is 25-.
+    """
+    url = (
+        "https://baseballsavant.mlb.com/leaderboard/sprint_speed"
+        f"?year={season}&position=&team=&min=10&csv=true"
+    )
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+        df = pd.read_csv(io.StringIO(r.text))
+        if "last_name, first_name" in df.columns:
+            df["player_name"] = df["last_name, first_name"].apply(
+                lambda s: " ".join(reversed([p.strip() for p in str(s).split(",")]))
+                if isinstance(s, str) and "," in s else s
+            )
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+# ----------------------------------------------------------------------------
+# Statcast Run Values per pitch type (better pitch quality metric than whiff%)
+# ----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
+# Traditional stats from MLB Stats API (WHIP, HR/9, OBP, HR totals)
+# ----------------------------------------------------------------------------
+
+@st.cache_data(ttl=900)  # v44.59: 15min (was 3600) so failures recover faster
+def get_hitter_traditional(season: int = None, stats_day: str = "") -> pd.DataFrame:
+    """Pull season AVG, OBP, SLG, HR, RBI, R for all hitters.
+
+    Uses playerPool=All to catch non-qualifying hitters (early-season,
+    platoon, callups). Defensive row parsing.
+
+    v44.59 (code review #5): retries 3x and RAISES on total failure so
+    Streamlit won't cache an empty frame for an hour (a transient MLB API
+    hiccup used to poison the cache). Callers use get_hitter_traditional_safe.
+    """
+    season = season if season is not None else current_season()  # v44.62
+    url = (
+        "https://statsapi.mlb.com/api/v1/stats"
+        f"?stats=season&group=hitting&season={season}&sportIds=1"
+        "&playerPool=All&limit=3000"
+    )
+    splits = []
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=20)
+            r.raise_for_status()
+            splits = r.json().get("stats", [{}])[0].get("splits", [])
+            if splits:
+                break
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                import time
+                time.sleep(1.5)
+            continue
+
+    # CRITICAL: raise so the cache doesn't store empty on a transient failure.
+    if not splits:
+        raise RuntimeError(f"MLB Stats API returned no hitter data (last error: {last_err})")
+
+    rows = []
+    for s in splits:
+        try:
+            p = s.get("player", {}) or {}
+            st_ = s.get("stat", {}) or {}
+            pid = p.get("id")
+            if pid is None:
+                continue
+            rows.append({
+                "player_id": pid,
+                "player_name": p.get("fullName"),
+                "avg": _safe_float(st_.get("avg")),
+                "obp": _safe_float(st_.get("obp")),
+                "slg": _safe_float(st_.get("slg")),
+                "ops": _safe_float(st_.get("ops")),
+                "home_run": _safe_int(st_.get("homeRuns")),
+                "rbi": _safe_int(st_.get("rbi")),
+                "runs": _safe_int(st_.get("runs")),
+                "sb": _safe_int(st_.get("stolenBases")),
+                "trad_pa": _safe_int(st_.get("plateAppearances")),
+            })
+        except Exception:
+            continue
+
+    if not rows:
+        raise RuntimeError("MLB Stats API returned hitter splits but no usable rows")
+
+    df = pd.DataFrame(rows)
+    return _normalize_player_df(df)
+
+
+def get_hitter_traditional_safe(season: int = CURRENT_SEASON, stats_day: str = "") -> pd.DataFrame:
+    """Wrapper that catches the cache-bust exception and returns empty df."""
+    try:
+        return get_hitter_traditional(season, stats_day=stats_day)
+    except Exception:
+        return pd.DataFrame()
+
+
+
+@st.cache_data(ttl=900)  # Shortened from 3600 to 15min so failures recover faster
+def get_pitcher_traditional(season: int = None, stats_day: str = "") -> pd.DataFrame:
+    """Pull season ERA, WHIP, HR/9, K/9, BB/9 for all pitchers.
+
+    Uses playerPool=All so non-qualifying pitchers (early-season, callups,
+    long relievers spot-starting) are included. Retries 3x; if all fail OR
+    return empty, we DON'T cache - by raising an exception that streamlit
+    won't cache, then catching it to return empty. Next refresh tries again.
+    """
+    season = season if season is not None else current_season()  # v44.62
+    url = (
+        "https://statsapi.mlb.com/api/v1/stats"
+        f"?stats=season&group=pitching&season={season}&sportIds=1"
+        "&playerPool=All&limit=3000"
+    )
+    splits = []
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=25)
+            r.raise_for_status()
+            splits = r.json().get("stats", [{}])[0].get("splits", [])
+            if splits:
+                break
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                import time
+                time.sleep(1.5)
+            continue
+
+    # CRITICAL: if we have no data, raise so the cache doesn't store empty
+    if not splits:
+        raise RuntimeError(f"MLB Stats API returned no pitcher data (last error: {last_err})")
+
+    rows = []
+    for s in splits:
+        try:
+            p = s.get("player", {}) or {}
+            st_ = s.get("stat", {}) or {}
+            pid = p.get("id")
+            if pid is None:
+                continue
+            rows.append({
+                "player_id": pid,
+                "player_name": p.get("fullName"),
+                "era": _safe_float(st_.get("era")),
+                "whip": _safe_float(st_.get("whip")),
+                "hr9": _safe_float(st_.get("homeRunsPer9")),
+                # API has used both field names in different versions - try both
+                "bb9": _safe_float(st_.get("walksPer9Inn") or st_.get("baseOnBallsPer9Inn")),
+                "k9": _safe_float(st_.get("strikeoutsPer9Inn") or st_.get("strikeOutsPer9Inn")),
+                "ip": _safe_float(st_.get("inningsPitched")),
+                "wins": _safe_int(st_.get("wins")),
+                "losses": _safe_int(st_.get("losses")),
+                "games_started": _safe_int(st_.get("gamesStarted")),
+                "games_played": _safe_int(st_.get("gamesPlayed")),
+                "strikeouts": _safe_int(st_.get("strikeOuts")),
+                "walks": _safe_int(st_.get("baseOnBalls")),
+                "earned_runs": _safe_int(st_.get("earnedRuns")),
+            })
+        except Exception:
+            continue
+
+    if not rows:
+        raise RuntimeError("MLB Stats API returned splits but no usable rows")
+
+    df = pd.DataFrame(rows)
+    return _normalize_player_df(df)
+
+
+def get_pitcher_traditional_safe(season: int = CURRENT_SEASON, stats_day: str = "") -> pd.DataFrame:
+    """Wrapper that catches the cache-bust exception and returns empty df."""
+    try:
+        return get_pitcher_traditional(season, stats_day=stats_day)
+    except Exception:
+        return pd.DataFrame()
+
+
+# ----------------------------------------------------------------------------
+# Per-pitcher fallback - guarantees data for today's starters
+# ----------------------------------------------------------------------------
+
+@st.cache_data(ttl=1800)
+def get_player_season_pitching(player_id: int, season: int = CURRENT_SEASON) -> dict:
+    """Fetch one pitcher's season stats directly by ID. Retries once on failure."""
+    url = (
+        f"https://statsapi.mlb.com/api/v1/people/{player_id}/stats"
+        f"?stats=season&group=pitching&season={season}&sportId=1"
+    )
+    splits = []
+    for attempt in range(2):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=12)
+            r.raise_for_status()
+            splits = r.json().get("stats", [{}])[0].get("splits", [])
+            if splits:
+                break
+        except Exception:
+            if attempt < 1:
+                import time
+                time.sleep(0.5)
+            continue
+    if not splits:
+        return {}
+    try:
+        st_ = splits[0].get("stat", {}) or {}
+        return {
+            "era": _safe_float(st_.get("era")),
+            "whip": _safe_float(st_.get("whip")),
+            "hr9": _safe_float(st_.get("homeRunsPer9")),
+            "bb9": _safe_float(st_.get("walksPer9Inn") or st_.get("baseOnBallsPer9Inn")),
+            "k9": _safe_float(st_.get("strikeoutsPer9Inn") or st_.get("strikeOutsPer9Inn")),
+            "ip": _safe_float(st_.get("inningsPitched")),
+            "games_started": _safe_int(st_.get("gamesStarted")),
+            "games_played": _safe_int(st_.get("gamesPlayed")),
+            "strikeouts": _safe_int(st_.get("strikeOuts")),
+            "walks": _safe_int(st_.get("baseOnBalls")),
+            "earned_runs": _safe_int(st_.get("earnedRuns")),
+        }
+    except Exception:
+        return {}
+
+
+def fill_hitter_bats(lineups: list, ids: set | None = None) -> dict:
+    """
+    Bulk-fetch batting handedness for all hitter IDs in the provided lineups.
+    Returns {player_id: "R"/"L"/"S"} mapping.
+    """
+    if ids is None:
+        ids = set()
+        for lineup in lineups:
+            for p in lineup or []:
+                pid = p.get("id")
+                if pid is not None:
+                    try:
+                        ids.add(int(pid))
+                    except (ValueError, TypeError):
+                        continue
+    if not ids:
+        return {}
+    # v44.69: chunk to 100 ids per request. A full slate (~300+ hitters) in one
+    # URL can exceed practical URL-length limits and fail the ENTIRE fetch,
+    # leaving every hitter without batting handedness. Chunking keeps each URL
+    # safe; a single chunk failing only loses that chunk, not all of it.
+    out = {}
+    _id_list = list(ids)
+    _failed_chunks = []
+    for _i in range(0, len(_id_list), 100):
+        _chunk = _id_list[_i:_i + 100]
+        try:
+            ids_str = ",".join(str(p) for p in _chunk)
+            url = f"https://statsapi.mlb.com/api/v1/people?personIds={ids_str}"
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            r.raise_for_status()
+            for person in r.json().get("people", []):
+                pid = person.get("id")
+                side = (person.get("batSide") or {}).get("code")
+                if pid and side:
+                    out[pid] = side
+        except Exception as _fhb_e:
+            # v46.14: was a bare `continue` — a failed chunk silently lost ~100
+            # hitters' bat-side (→ they fall back to a default hand, quietly
+            # skewing platoon matchups). Log which chunk + surface to health.
+            _failed_chunks.append((len(_chunk), type(_fhb_e).__name__))
+            continue  # lose only this chunk, keep the rest
+    if _failed_chunks:
+        try:
+            import streamlit as _stx
+            _n_lost = sum(c for c, _ in _failed_chunks)
+            _stx.session_state["_bat_side_fetch_status"] = (
+                f"⚠️ bat-side fetch: {len(_failed_chunks)} chunk(s) failed, "
+                f"~{_n_lost} hitters missing handedness (default-hand fallback)")
+        except Exception:
+            pass
+    else:
+        try:
+            import streamlit as _stx
+            _stx.session_state["_bat_side_fetch_status"] = "✅ bat-side complete"
+        except Exception:
+            pass
+    return out
+
+
+@st.cache_data(ttl=86400)
+def fetch_player_debut_years(ids: tuple) -> dict:
+    """
+    Bulk-fetch MLB debut year for player IDs. Used for rookie detection.
+    Returns {player_id: debut_year_int}. Cached 24h.
+    """
+    if not ids:
+        return {}
+    # v44.69: chunk to 100 ids (same URL-length safety as fill_hitter_bats)
+    out = {}
+    _id_list = list(ids)
+    for _i in range(0, len(_id_list), 100):
+        _chunk = _id_list[_i:_i + 100]
+        try:
+            ids_str = ",".join(str(p) for p in _chunk)
+            url = (
+                f"https://statsapi.mlb.com/api/v1/people?personIds={ids_str}"
+                "&hydrate=mlbDebutDate"
+            )
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            r.raise_for_status()
+            for person in r.json().get("people", []):
+                pid = person.get("id")
+                debut = person.get("mlbDebutDate")
+                if pid and debut:
+                    try:
+                        out[pid] = int(debut[:4])
+                    except (ValueError, TypeError):
+                        continue
+        except Exception:
+            continue  # lose only this chunk
+    return out
+
+
+def is_rookie(debut_year: int | None, current_year: int = CURRENT_SEASON) -> bool:
+    """
+    A player is a rookie if their MLB debut is this year or the prior offseason.
+    Strictly: debut_year == current_year means they're a definite rookie.
+    debut_year == current_year - 1 with limited PA could also be a rookie,
+    but that requires PA threshold checking which we leave to the caller.
+    """
+    if debut_year is None:
+        return False
+    return debut_year == current_year
+
+
+@st.cache_data(ttl=86400)  # cache for 24h - LA changes slowly
+def get_hitter_launch_angle_season(player_id: int, season: int = CURRENT_SEASON) -> float | None:
+    """
+    Pull real season-long launch angle for ONE hitter from Statcast search.
+    This is the bulletproof source - reads raw batted-ball events and
+    computes the player's actual average launch angle.
+
+    Returns None if no batted-ball data exists for this player.
+    """
+    from datetime import date
+    end = date.today()
+    start = date(season, 3, 1)  # season start (early March covers spring + reg)
+    url = (
+        "https://baseballsavant.mlb.com/statcast_search/csv"
+        f"?all=true&hfPT=&hfAB=&hfGT=R%7C&hfPR=&hfZ=&stadium=&hfBBL=&hfNewZones="
+        f"&hfPull=&hfC=&hfSea={season}%7C&hfSit=&player_type=batter&hfOuts=&opponent="
+        f"&pitcher_throws=&batter_stands=&hfSA=&game_date_gt={start.isoformat()}"
+        f"&game_date_lt={end.isoformat()}&batters_lookup%5B%5D={player_id}"
+        f"&team=&position=&hfRO=&home_road=&hfFlag=&metric_1=&hfInn=&min_pitches=0"
+        f"&min_results=0&group_by=name&sort_col=pitches"
+        f"&player_event_sort=api_p_release_speed&sort_order=desc&min_pas=0&type=details"
+    )
+    try:
+        # Statcast season CSVs for one player can be 5MB+, so the per-player
+        # search is slow. Bump timeout to 60s. The bulk leaderboard fetch
+        # in fill_hitter_la_for_slate handles 95%+ of players in one call,
+        # so this slow path only runs for a handful of names per slate.
+        r = requests.get(url, headers=HEADERS, timeout=60)
+        r.raise_for_status()
+        df = pd.read_csv(io.StringIO(r.text))
+        if df.empty:
+            return None
+        # Only count batted balls (type == 'X')
+        bbe = df[df["type"] == "X"] if "type" in df.columns else df
+        if bbe.empty or "launch_angle" not in bbe.columns:
+            return None
+        la_series = pd.to_numeric(bbe["launch_angle"], errors="coerce")
+        la_series = la_series.dropna()
+        if la_series.empty:
+            return None
+        return round(float(la_series.mean()), 1)
+    except Exception:
+        return None
+
+
+def fill_hitter_la_for_slate(hitter_stats: pd.DataFrame, slate: pd.DataFrame,
+                                season: int = CURRENT_SEASON,
+                                log_steps: list | None = None) -> pd.DataFrame:
+    """
+    For every hitter projected to play today, if launch_angle is missing,
+    patch it in.
+
+    STRATEGY (May 2026): try bulk leaderboard FIRST, then fall back to slow
+    per-player Statcast search only for any IDs the bulk pull missed.
+    Previous version only did per-player which timed out at 30s for
+    150-200 slate hitters (Statcast season CSVs can be 5MB+ each).
+
+    DIAGNOSTIC: pass a `log_steps` list to receive per-step messages about
+    which bulk endpoints were tried, which succeeded, how many IDs were
+    matched, and whether per-player fallback ran. Used by the LA diagnostic
+    expander in app.py to make silent failures visible.
+
+    Returns the hitter_stats df with launch_angle patched in.
+    """
+    def _log(msg):
+        if log_steps is not None:
+            log_steps.append(msg)
+
+    if hitter_stats is None or hitter_stats.empty:
+        _log("EARLY EXIT: hitter_stats is None or empty")
+        return hitter_stats
+    if "launch_angle" not in hitter_stats.columns:
+        hitter_stats = hitter_stats.copy()
+        hitter_stats["launch_angle"] = pd.NA
+        _log("Created launch_angle column (was missing)")
+
+    df = hitter_stats.copy()
+    df["player_id"] = pd.to_numeric(df["player_id"], errors="coerce").astype("Int64")
+    _log(f"Input: {len(df)} hitters, {df['launch_angle'].isna().sum()} missing LA")
+
+    # ----- STEP 1: Bulk leaderboard pull (single API hit, covers everyone) -----
+    # Same endpoints as the in-pipeline fallback in get_hitter_stats.
+    bulk_la_urls = [
+        f"https://baseballsavant.mlb.com/leaderboard/statcast"
+        f"?type=batter&year={season}&position=&team=&min=1&csv=true",
+        f"https://baseballsavant.mlb.com/leaderboard/custom"
+        f"?year={season}&type=batter&filter=&min=1"
+        f"&selections=pa,launch_angle,launch_speed,avg_hit_angle"
+        f"&chart=false&x=pa&y=pa&r=no&csv=true",
+        f"https://baseballsavant.mlb.com/leaderboard/exit-velocity"
+        f"?type=batter&year={season}&min=1&csv=true",
+    ]
+    la_map_bulk = {}
+    for i, url in enumerate(bulk_la_urls, 1):
+        url_label = url.split("/leaderboard/")[1].split("?")[0]
+        try:
+            rr = requests.get(url, headers=HEADERS, timeout=20)
+            rr.raise_for_status()
+            ev_df = pd.read_csv(io.StringIO(rr.text))
+            if ev_df.empty:
+                _log(f"  [{i}/{len(bulk_la_urls)}] {url_label}: empty CSV")
+                continue
+            la_col = None
+            for cand in ["launch_angle", "avg_hit_angle", "angle",
+                            "avg_launch_angle", "avg_la", "la"]:
+                if cand in ev_df.columns:
+                    coerced = pd.to_numeric(ev_df[cand], errors="coerce")
+                    if coerced.notna().any():
+                        ev_df[cand] = coerced
+                        la_col = cand
+                        break
+            id_col = None
+            for cand in ["player_id", "mlb_id", "MLBAMID", "playerid", "id"]:
+                if cand in ev_df.columns:
+                    id_col = cand
+                    break
+            if la_col and id_col:
+                ev_df[id_col] = pd.to_numeric(ev_df[id_col], errors="coerce").astype("Int64")
+                tmp_map = dict(zip(ev_df[id_col], ev_df[la_col]))
+                # Drop NaNs from the map
+                la_map_bulk = {k: v for k, v in tmp_map.items()
+                                if v is not None and not pd.isna(v)}
+                _log(f"  [{i}/{len(bulk_la_urls)}] {url_label}: {len(la_map_bulk)} IDs (la_col={la_col}, id_col={id_col})")
+                if la_map_bulk:
+                    break
+            else:
+                avail_cols = list(ev_df.columns)[:8]
+                _log(f"  [{i}/{len(bulk_la_urls)}] {url_label}: no la_col or id_col found. Got: {avail_cols}")
+        except Exception as e:
+            _log(f"  [{i}/{len(bulk_la_urls)}] {url_label}: EXCEPTION {type(e).__name__}: {str(e)[:120]}")
+            continue
+
+    if la_map_bulk:
+        # Apply bulk values everywhere we have a missing LA
+        missing_mask = df["launch_angle"].isna()
+        n_before = missing_mask.sum()
+        df.loc[missing_mask, "launch_angle"] = (
+            df.loc[missing_mask, "player_id"].map(la_map_bulk)
+        )
+        n_after = df["launch_angle"].isna().sum()
+        _log(f"Bulk pull patched {n_before - n_after} LA values; {n_after} still missing")
+    else:
+        _log("Bulk pull returned no map. ALL endpoints failed or empty.")
+
+    # ----- STEP 2: Per-player slow fetch ONLY for slate-relevant hitters
+    # who are STILL missing after the bulk pull -----
+    relevant_ids = set()
+    if not slate.empty:
+        for _, g in slate.iterrows():
+            for col in ("away_team_id", "home_team_id"):
+                tid = g.get(col)
+                if tid is None or pd.isna(tid):
+                    continue
+                try:
+                    roster = get_team_roster(int(tid))
+                    for p in roster:
+                        pid = p.get("id")
+                        if pid:
+                            relevant_ids.add(int(pid))
+                except Exception:
+                    continue
+
+    if not relevant_ids:
+        _log("No slate-relevant IDs to fetch per-player. Done.")
+        return df
+
+    missing_la_ids = set()
+    for pid in relevant_ids:
+        rows = df[df["player_id"] == pid]
+        if rows.empty:
+            continue
+        existing_la = rows.iloc[0].get("launch_angle")
+        if existing_la is None or pd.isna(existing_la):
+            missing_la_ids.add(pid)
+
+    _log(f"Per-player fallback: {len(missing_la_ids)} slate hitters still missing LA")
+
+    # Cap per-player fetches to 50 to bound worst-case time. Anyone past 50
+    # gets neutral (no LA) — far better than hanging the page.
+    patched = 0
+    failed = 0
+    for i, pid in enumerate(missing_la_ids):
+        if i >= 50:
+            _log(f"  Capped at 50 per-player fetches; {len(missing_la_ids) - 50} skipped")
+            break
+        la = get_hitter_launch_angle_season(pid, season)
+        if la is not None:
+            df.loc[df["player_id"] == pid, "launch_angle"] = la
+            patched += 1
+        else:
+            failed += 1
+    _log(f"Per-player fallback: patched {patched}, failed {failed}")
+    final_missing = df["launch_angle"].isna().sum()
+    _log(f"FINAL: {len(df) - final_missing}/{len(df)} hitters have LA ({final_missing} still missing)")
+
+    return df
+
+
+# ----------------------------------------------------------------------------
+# HR PROFILE: avg exit velo on HRs + avg HR distance (June 2026)
+# ----------------------------------------------------------------------------
+# For each hitter, what's their average exit velocity ON HOME RUNS specifically
+# (not all batted balls), and how far does that HR go on average?
+#
+# A player who hits 110+ mph HRs at 380 ft has a "laser" profile — line-drive
+# HRs over the wall. A player who hits 100 mph HRs at 425 ft has a "moonshot"
+# profile — high-trajectory HRs that clear the fence on arc.
+#
+# Both can be productive HR hitters but they project differently:
+#   - Laser HRs are LESS affected by wind/altitude (lower hang time)
+#   - Moonshot HRs are MORE affected by park dimensions and weather
+#
+# Data source: Savant's barrels-leaderboard endpoint, which has avg_hr_distance
+# and max_hit_speed natively. We pull it once per slate (cached 1hr).
+# ----------------------------------------------------------------------------
+
+@st.cache_data(ttl=3600)
+def get_hitter_hr_profile(season: int = CURRENT_SEASON,
+                           _cache_version: str = "v42c") -> pd.DataFrame:
+    """
+    Returns per-hitter HR profile metrics:
+      - player_id
+      - avg_hr_distance  (avg distance of THIS hitter's HRs, in feet)
+      - max_hit_speed    (max exit velo of any batted ball — proxy for top-end power)
+      - hr_profile       (categorical: "moonshot" / "balanced" / "laser" / None)
+      - hr_profile_label (display string with emoji)
+
+    _cache_version: bump to invalidate stale cached results. Bumped to v42c
+    when the fabricated-zero fix shipped (Savant returns 0 for hitters with
+    no HRs; we coerce ≤50 ft/mph to NaN).
+    """
+    url = (
+        "https://baseballsavant.mlb.com/leaderboard/statcast"
+        f"?type=batter&year={season}&position=&team=&min=1&csv=true"
+    )
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=30)
+        r.raise_for_status()
+        df = pd.read_csv(io.StringIO(r.text))
+        if df.empty:
+            return pd.DataFrame()
+
+        # Column name candidates (Savant varies slightly across endpoints)
+        id_col = None
+        for cand in ("player_id", "mlb_id", "playerid", "id", "MLBAMID"):
+            if cand in df.columns:
+                id_col = cand
+                break
+        if id_col is None:
+            return pd.DataFrame()
+
+        dist_col = None
+        for cand in ("avg_hr_distance", "avg_hr_dist", "hr_distance_avg"):
+            if cand in df.columns:
+                dist_col = cand
+                break
+
+        ev_col = None
+        for cand in ("max_hit_speed", "max_ev", "max_exit_velocity"):
+            if cand in df.columns:
+                ev_col = cand
+                break
+
+        if not dist_col and not ev_col:
+            return pd.DataFrame()
+
+        out = pd.DataFrame()
+        out["player_id"] = pd.to_numeric(df[id_col], errors="coerce").astype("Int64")
+        if dist_col:
+            _dist = pd.to_numeric(df[dist_col], errors="coerce")
+            # v42b: Savant returns 0 for hitters with no HRs (no distance to
+            # average). 0 ft is not a real measurement — coerce to NaN so
+            # downstream classifiers see "no data" instead of an absurd value.
+            # Any real HR is > 50 ft; 0 means missing.
+            _dist = _dist.mask(_dist <= 50)
+            out["avg_hr_distance"] = _dist.round(1)
+        if ev_col:
+            _ev = pd.to_numeric(df[ev_col], errors="coerce")
+            # v42b: same fix — 0 mph max EV means "no batted balls tracked".
+            # Any real swing > 50 mph; 0 is missing.
+            _ev = _ev.mask(_ev <= 50)
+            out["max_hit_speed"] = _ev.round(1)
+
+        # Classify HR profile:
+        #   moonshot — high distance (>= 415 ft avg HR distance)
+        #   laser    — high EV but lower distance (max EV >= 110 AND avg_hr_dist < 400)
+        #   balanced — middle ground
+        #   None     — no data
+        def _classify(r):
+            dist = r.get("avg_hr_distance")
+            ev = r.get("max_hit_speed")
+            if (dist is None or pd.isna(dist)) and (ev is None or pd.isna(ev)):
+                return (None, None)
+            try:
+                dist_f = float(dist) if (dist is not None and not pd.isna(dist)) else None
+                ev_f = float(ev) if (ev is not None and not pd.isna(ev)) else None
+            except (TypeError, ValueError):
+                return (None, None)
+            if dist_f is not None and dist_f >= 415:
+                return ("moonshot", f"🚀 moonshot ({dist_f:.0f}ft)")
+            if dist_f is not None and dist_f >= 405:
+                return ("balanced+", f"⚖️ balanced+ ({dist_f:.0f}ft)")
+            if ev_f is not None and ev_f >= 112 and (dist_f is None or dist_f < 400):
+                return ("laser", f"⚡ laser ({ev_f:.0f}mph)")
+            if dist_f is not None and dist_f >= 390:
+                return ("balanced", f"⚖️ balanced ({dist_f:.0f}ft)")
+            if dist_f is not None:
+                return ("short", f"📏 short porch ({dist_f:.0f}ft)")
+            return (None, None)
+        classifications = out.apply(_classify, axis=1)
+        out["hr_profile"] = [c[0] for c in classifications]
+        out["hr_profile_label"] = [c[1] for c in classifications]
+        return out
+    except Exception:
+        return pd.DataFrame()
+
+
+def fill_pitcher_stats_for_slate(pitcher_stats: pd.DataFrame, slate: pd.DataFrame,
+                                   season: int = CURRENT_SEASON) -> pd.DataFrame:
+    """
+    For every probable starter in the slate, if they're missing key stats
+    in pitcher_stats, fetch them individually and patch them in.
+    Guarantees ERA/K9/etc for every starter today (assuming they have stats).
+    """
+    if pitcher_stats is None or slate is None or slate.empty:
+        return pitcher_stats
+
+    df = pitcher_stats.copy() if pitcher_stats is not None and not pitcher_stats.empty else pd.DataFrame()
+    if df.empty:
+        df = pd.DataFrame(columns=["player_id"])
+
+    # Ensure key columns exist
+    for col in ["era", "whip", "k9", "bb9", "hr9", "ip", "games_started", "p_throws"]:
+        if col not in df.columns:
+            df[col] = pd.NA
+
+    # Get starter IDs from slate
+    starter_ids = set()
+    for col in ["away_pitcher_id", "home_pitcher_id"]:
+        if col in slate.columns:
+            for pid in slate[col].dropna().unique():
+                try:
+                    starter_ids.add(int(pid))
+                except (ValueError, TypeError):
+                    continue
+
+    # Bulk-fetch handedness for all starters via people endpoint
+    if starter_ids:
+        try:
+            ids_str = ",".join(str(p) for p in starter_ids)
+            url = f"https://statsapi.mlb.com/api/v1/people?personIds={ids_str}"
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            r.raise_for_status()
+            for person in r.json().get("people", []):
+                pid = person.get("id")
+                hand = (person.get("pitchHand") or {}).get("code")
+                if pid is None or not hand:
+                    continue
+                # v44.60 (code review #11): coerce before comparing. After
+                # concatenating fallback rows (plain int) onto Savant rows
+                # (Int64), a bare == can miss on dtype drift — same class as
+                # the v44.34 build_matchup_table fix.
+                if "player_id" in df.columns:
+                    _pidnum = pd.to_numeric(df["player_id"], errors="coerce")
+                    try:
+                        existing = df[_pidnum == int(float(pid))]
+                    except (TypeError, ValueError):
+                        existing = pd.DataFrame()
+                else:
+                    existing = pd.DataFrame()
+                if existing.empty:
+                    df = pd.concat([df, pd.DataFrame([{"player_id": pid, "p_throws": hand}])],
+                                      ignore_index=True)
+                else:
+                    df.at[existing.index[0], "p_throws"] = hand
+        except Exception:
+            pass
+
+    for pid in starter_ids:
+        # v44.60 (code review #11): coerce before comparing (dtype drift).
+        if "player_id" in df.columns:
+            _pidnum2 = pd.to_numeric(df["player_id"], errors="coerce")
+            try:
+                existing = df[_pidnum2 == int(float(pid))]
+            except (TypeError, ValueError):
+                existing = pd.DataFrame()
+        else:
+            existing = pd.DataFrame()
+        needs_fill = (
+            existing.empty
+            or pd.isna(existing.iloc[0].get("k9"))
+            or pd.isna(existing.iloc[0].get("era"))
+        )
+        if not needs_fill:
+            continue
+
+        # Try the standard season endpoint first
+        stats = get_player_season_pitching(pid, season)
+        # Fall back to game log aggregation (independent code path - more reliable)
+        if not stats or stats.get("k9") is None or stats.get("era") is None:
+            gl_stats = get_pitcher_full_season_from_gamelog(pid, season)
+            if gl_stats and gl_stats.get("k9") is not None:
+                stats = gl_stats
+        if not stats or stats.get("k9") is None:
+            continue
+
+        if existing.empty:
+            new_row = {"player_id": pid}
+            new_row.update(stats)
+            df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+        else:
+            idx = existing.index[0]
+            for k, v in stats.items():
+                if v is not None and not (isinstance(v, float) and pd.isna(v)):
+                    df.at[idx, k] = v
+
+    return _normalize_player_df(df)
+
+
+# ----------------------------------------------------------------------------
+# Recent form: rolling 15-game Statcast
+# ----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
+# Team-level pitching - used as fallback when probable pitcher is TBD
+# ----------------------------------------------------------------------------
+
+@st.cache_data(ttl=3600)
+def get_team_pitching(team_id: int, season: int = CURRENT_SEASON) -> dict:
+    """
+    Get team-aggregate pitching stats. Used when the day's starter is TBD
+    or unknown (e.g. bullpen game). Returns dict shaped like a single
+    pitcher row so models can drop it in as a proxy.
+    """
+    url = (
+        "https://statsapi.mlb.com/api/v1/stats"
+        f"?stats=season&group=pitching&season={season}&sportIds=1"
+        f"&teamId={team_id}"
+    )
+    splits = []
+    for attempt in range(2):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=12)
+            r.raise_for_status()
+            splits = r.json().get("stats", [{}])[0].get("splits", [])
+            if splits:
+                break
+        except Exception:
+            if attempt < 1:
+                import time
+                time.sleep(0.5)
+            continue
+    if not splits:
+        return {}
+    for s in splits:
+        try:
+            team = s.get("team", {}) or {}
+            if team.get("id") != team_id:
+                continue
+            st_ = s.get("stat", {}) or {}
+            return {
+                "player_id": None,
+                "player_name": f"Team Avg ({team.get('abbreviation', '')})",
+                "is_team_avg": True,
+                "era": _safe_float(st_.get("era")),
+                "whip": _safe_float(st_.get("whip")),
+                "hr9": _safe_float(st_.get("homeRunsPer9")),
+                "bb9": _safe_float(st_.get("walksPer9Inn") or st_.get("baseOnBallsPer9Inn")),
+                "k9": _safe_float(st_.get("strikeoutsPer9Inn") or st_.get("strikeOutsPer9Inn")),
+                "ip": _safe_float(st_.get("inningsPitched")),
+                "earned_runs": _safe_int(st_.get("earnedRuns")),
+                "home_run": _safe_int(st_.get("homeRuns")),
+            }
+        except Exception:
+            continue
+    return {}
+
+
+def get_team_pitching_proxy(team_id: int, season: int = CURRENT_SEASON,
+                              hr_penalty: float = 1.10) -> dict:
+    """
+    Wrapper that returns team pitching with a small HR-allowance penalty applied.
+    TBD/bullpen games tend to allow MORE HRs than a typical starter.
+    """
+    proxy = get_team_pitching(team_id, season)
+    if not proxy:
+        return {}
+    if proxy.get("hr9") is not None:
+        proxy["hr9_tbd_adjusted"] = round(proxy["hr9"] * hr_penalty, 2)
+    proxy["tbd_proxy"] = True
+    return proxy
+
+
+@st.cache_data(ttl=21600)  # 6 hour cache
+def get_team_bullpen_hr9(team_id: int, season: int = CURRENT_SEASON) -> float | None:
+    """
+    Fetch the team's BULLPEN-ONLY HR/9 (excludes starters).
+
+    Used for bullpen-leverage adjustment: when a starter exits early, the
+    bullpen pitches the remainder. A team with a high bullpen HR/9
+    (Rockies, Twins, A's, etc.) means even good starters expose hitters to
+    HR-vulnerable relievers later in the game.
+
+    Returns None if data unavailable (caller should fall back to league avg).
+    """
+    url = (
+        "https://statsapi.mlb.com/api/v1/stats"
+        f"?stats=season&group=pitching&season={season}&sportIds=1"
+        f"&teamId={team_id}&playerPool=ALL"
+    )
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=12)
+        r.raise_for_status()
+        splits = r.json().get("stats", [{}])[0].get("splits", [])
+    except Exception:
+        return None
+
+    # Aggregate HR and IP across all pitchers on the team where the pitcher
+    # appears as a reliever (gamesStarted < 50% of appearances).
+    total_hr = 0
+    total_ip = 0.0
+    for s in splits:
+        try:
+            stat = s.get("stat", {}) or {}
+            games = _safe_int(stat.get("gamesPlayed")) or 0
+            starts = _safe_int(stat.get("gamesStarted")) or 0
+            if games == 0:
+                continue
+            if starts / games >= 0.5:
+                continue  # Classified as a starter
+            hr = _safe_int(stat.get("homeRuns")) or 0
+            ip = _safe_ip(stat.get("inningsPitched")) or 0.0  # v46.07: thirds-aware (summed for rate)
+            total_hr += hr
+            total_ip += ip
+        except Exception:
+            continue
+
+    if total_ip < 30:
+        return None
+    return round((total_hr * 9.0) / total_ip, 2)
+
+
+@st.cache_data(ttl=3600)
+def get_team_hitting_aggregates(season: int = CURRENT_SEASON) -> pd.DataFrame:
+    """
+    Returns one row per team with aggregate hitting tendencies:
+      - team_id, team_abbr, k_pct, bb_pct, hr_per_pa, iso
+
+    Iterates all 30 teams, fetching team-level hitting from MLB Stats API.
+    Cached 1 hour.
+    """
+    # First, fetch the list of all MLB teams
+    try:
+        teams_url = f"https://statsapi.mlb.com/api/v1/teams?sportId=1&season={season}"
+        r = requests.get(teams_url, headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        teams_data = r.json()
+    except Exception:
+        return pd.DataFrame()
+
+    rows = []
+    for team in teams_data.get("teams", []):
+        team_id = team.get("id")
+        team_abbr = team.get("abbreviation") or team.get("teamCode")
+        team_name = team.get("name")
+        if not team_id:
+            continue
+        # Fetch this team's hitting stats
+        try:
+            url = (
+                f"https://statsapi.mlb.com/api/v1/teams/{team_id}/stats"
+                f"?stats=season&group=hitting&season={season}&sportIds=1"
+            )
+            tr = requests.get(url, headers=HEADERS, timeout=15)
+            tr.raise_for_status()
+            data = tr.json()
+        except Exception:
+            continue
+        # v43.62 (reviewer suggestion): use an explicit flag for the
+        # nested loops. The old pattern (`break` inner + `if rows[-1] is
+        # this team: break`) is brittle if a team returns multiple split
+        # blocks AND the last-pushed row happens to match this team_id.
+        # An explicit flag is unambiguous.
+        _team_done = False
+        for split_block in data.get("stats", []):
+            if _team_done:
+                break
+            for sp in split_block.get("splits", []):
+                stat = sp.get("stat") or {}
+                try:
+                    pa = int(stat.get("plateAppearances") or 0)
+                    k = int(stat.get("strikeOuts") or 0)
+                    hr = int(stat.get("homeRuns") or 0)
+                    ab = int(stat.get("atBats") or 0)
+                    # v43.82 cleanup: `hits` was assigned but never used
+                    doubles = int(stat.get("doubles") or 0)
+                    triples = int(stat.get("triples") or 0)
+                    walks = int(stat.get("baseOnBalls") or 0)
+                except (ValueError, TypeError):
+                    continue
+                if pa == 0 or ab == 0:
+                    continue
+                iso = ((doubles + 2*triples + 3*hr) / ab) if ab > 0 else None
+                rows.append({
+                    "team_id": team_id,
+                    "team_abbr": team_abbr,
+                    "team_name": team_name,
+                    "pa": pa,
+                    "k_pct": round(k / pa * 100, 1),
+                    "bb_pct": round(walks / pa * 100, 1),
+                    "hr_per_pa": round(hr / pa * 100, 2),
+                    "iso": round(iso, 3) if iso is not None else None,
+                })
+                _team_done = True
+                break  # Just take the first split (regular season)
+    return pd.DataFrame(rows)
+
+
+# =============================================================================
+# REAL ROOF STATUS — pulls actual condition from MLB game feed
+# =============================================================================
+# MLB Stats API includes the literal roof status in gameData.weather.condition
+# for indoor/retractable venues. Values seen in production:
+#   - "Roof Closed"   (retractable park with roof closed for this game)
+#   - "Dome"          (permanent dome, e.g., Tropicana Field)
+#   - "Clear", "Partly Cloudy", "Cloudy", "Rain"   (outdoor or roof open)
+# This gives us the GROUND TRUTH instead of guessing from temperature.
+
+@st.cache_data(ttl=300)  # 5min — refresh often, roof decisions can change pre-game
+def get_game_roof_status(game_pk: int) -> dict:
+    """
+    Return real roof status + MLB-reported weather for a game.
+
+    Returns dict:
+        {
+            "roof_closed": bool | None,  # None = unknown
+            "condition": str,            # raw condition string from MLB
+            "temp": float | None,        # MLB-reported temp
+            "wind": str,                 # MLB-reported wind ("X mph, From CF")
+        }
+    """
+    url = f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live"
+    out = {"roof_closed": None, "condition": "", "temp": None, "wind": ""}
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=12)
+        if r.status_code != 200:
+            return out
+        data = r.json()
+        wx = data.get("gameData", {}).get("weather", {})
+        condition = wx.get("condition", "") or ""
+        out["condition"] = condition
+        out["wind"] = wx.get("wind", "") or ""
+        temp_str = wx.get("temp", "")
+        try:
+            out["temp"] = float(temp_str) if temp_str else None
+        except (ValueError, TypeError):
+            out["temp"] = None
+        # Decide roof state from condition string
+        cond_lower = condition.lower()
+        if any(kw in cond_lower for kw in
+               ("roof closed", "closed roof", "dome", "indoor")):
+            out["roof_closed"] = True
+        elif "roof open" in cond_lower:
+            out["roof_closed"] = False
+        elif condition and any(
+            outdoor_kw in cond_lower
+            for outdoor_kw in ("clear", "sunny", "cloud", "rain", "overcast",
+                                "wind", "partly", "drizzle", "mist", "fog",
+                                "snow", "shower")
+        ):
+            # Any actual weather description = open-air conditions
+            out["roof_closed"] = False
+        # else: leave as None (unknown)
+        return out
+    except Exception:
+        return out
+
+
+# =============================================================================
+# SLATE-WIDE TRANSACTIONS — surface roster moves so user knows what changed
+# =============================================================================
+
+@st.cache_data(ttl=900)  # 15min — roster moves can happen mid-day
+def get_recent_transactions(days_back: int = 2, stats_day: str = "") -> pd.DataFrame:
+    """
+    Pull all MLB roster transactions from the last N days.
+
+    Returns df with columns:
+        date, type_code, type_desc, player_name, player_id, from_team, to_team,
+        description
+
+    type_code legend (most important for hitter/pitcher impact):
+        TR  = Traded
+        SC  = Signed as free agent
+        DFA = Designated for Assignment
+        REL = Released
+        OUT = Outrighted
+        CU  = Called Up (from minors)
+        SD  = Sent Down (to minors)
+        SCL = Selected from minors (added to 40-man)
+        IL  = Placed on Injured List
+        RTN = Returned to team / activated from IL
+        STA = Status change
+
+    These directly impact:
+      - Trades/signings: stats/team data may not yet reflect new team
+      - DFA/release: player no longer available
+      - Call-ups: new player to evaluate (low PA, insufficient sample)
+      - IL moves: pitcher fresh from IL = role detection adjustment
+    """
+    from datetime import date, timedelta
+    end_d = date.today()
+    start_d = end_d - timedelta(days=days_back)
+    url = (
+        "https://statsapi.mlb.com/api/v1/transactions"
+        f"?startDate={start_d.isoformat()}&endDate={end_d.isoformat()}"
+    )
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        if r.status_code != 200:
+            return pd.DataFrame()
+        data = r.json()
+    except Exception:
+        return pd.DataFrame()
+    rows = []
+    for txn in data.get("transactions", []):
+        person = txn.get("person", {}) or {}
+        from_team = (txn.get("fromTeam") or {}).get("name", "")
+        to_team = (txn.get("toTeam") or {}).get("name", "")
+        rows.append({
+            "date": txn.get("date", ""),
+            "type_code": txn.get("typeCode", ""),
+            "type_desc": txn.get("typeTr", "") or txn.get("typeDesc", ""),
+            "player_name": person.get("fullName", ""),
+            "player_id": person.get("id"),
+            "from_team": from_team,
+            "to_team": to_team,
+            "description": txn.get("description", ""),
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        # Sort newest first
+        df = df.sort_values("date", ascending=False).reset_index(drop=True)
+    return df
+
+
+# =============================================================================
+# PITCHER PRIMARY POSITION (SP / RP / P) — MLB's official role label
+# =============================================================================
+# MLB Stats API returns each player's primaryPosition. For pitchers this is
+# usually one of:
+#   - "SP"  (Starting Pitcher)
+#   - "RP"  (Relief Pitcher)
+#   - "P"   (generic Pitcher - ambiguous)
+#   - "TWP" (Two-Way Player, e.g., Ohtani)
+# When MLB says SP, trust it. When they say RP but we have them as a probable
+# starter today, that's a real signal they're being used as an opener.
+
+@st.cache_data(ttl=3600)
+def get_pitcher_primary_positions(pitcher_ids: tuple) -> dict:
+    """
+    Bulk-fetch primary position designations for a tuple of pitcher IDs.
+    Returns {player_id: "SP" | "RP" | "P" | "TWP" | ""}.
+    """
+    if not pitcher_ids:
+        return {}
+    # MLB Stats API people endpoint supports comma-separated IDs (up to ~100)
+    ids_str = ",".join(str(int(float(pid))) for pid in pitcher_ids if pd.notna(pid) and str(pid).strip() not in ("", "None"))
+    url = f"https://statsapi.mlb.com/api/v1/people?personIds={ids_str}"
+    out = {}
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        if r.status_code != 200:
+            return {}
+        data = r.json()
+        for person in data.get("people", []):
+            pid = person.get("id")
+            pos = (person.get("primaryPosition") or {}).get("abbreviation", "")
+            if pid:
+                try:
+                    out[int(pid)] = pos
+                except (ValueError, TypeError):
+                    continue
+        return out
+    except Exception:
+        return {}
