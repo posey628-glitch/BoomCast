@@ -1491,6 +1491,25 @@ def auto_run_pattern_discovery() -> dict:
                     snaps["_player_outcome_log"] = _pp_log
                 _gist_write_all(snaps)
                 result["n_history_days"] = len(history)
+
+                # LaunchCast 2.0: evidence-driven AUTO-REWEIGHT. After the
+                # pattern history is persisted, evaluate the strict bar and, if
+                # cleared, apply a small capped quarter-step to the live DINGER
+                # weights (persisted to the gist, effective next run). Fully
+                # guarded + never raises — reweighting must never break grading.
+                try:
+                    from pattern_analysis import rolling_feature_importance, propose_dinger_weights
+                    from scoring import DINGER_BASE_WEIGHTS
+                    from auto_reweight import maybe_auto_reweight, load_live_weights
+                    _imp = rolling_feature_importance(history)
+                    _live = load_live_weights(_gist_read_all, DINGER_BASE_WEIGHTS)
+                    _rw = maybe_auto_reweight(
+                        _gist_read_all, _gist_write_all, _imp,
+                        _live, DINGER_BASE_WEIGHTS, propose_dinger_weights)
+                    result["auto_reweight"] = _rw
+                except Exception as _rwe:
+                    result["auto_reweight"] = {"applied": False,
+                                               "reason": f"skipped: {type(_rwe).__name__}"}
             except Exception:
                 # Non-fatal — session still has computed entries
                 pass
