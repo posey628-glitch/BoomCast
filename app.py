@@ -385,6 +385,22 @@ from helpers import (
 )
 from ui_render import _section_banner, _player_col, _render_wind_diagram
 from pipeline import _add_robbed_hr_cols
+
+# LaunchCast 2.0: at startup, load any evidence-driven auto-applied DINGER
+# weights from the durable gist and activate them for scoring. Fully guarded —
+# if the gist read fails or returns anything unexpected, scoring keeps using the
+# shipped DINGER_BASE_WEIGHTS default (set_active_dinger_weights rejects bad
+# input). This is what makes auto-reweight actually affect picks + survive
+# restarts, without ever risking the scoring path.
+try:
+    import scoring as _scoring_mod
+    from auto_reweight import load_live_weights as _load_live_w
+    from backtest import _gist_read_all as _gr_all
+    _live_w = _load_live_w(_gr_all, _scoring_mod.DINGER_BASE_WEIGHTS)
+    _applied_ok = _scoring_mod.set_active_dinger_weights(_live_w)
+    _AUTO_WEIGHTS_ACTIVE = bool(_applied_ok and _live_w != dict(_scoring_mod.DINGER_BASE_WEIGHTS))
+except Exception:
+    _AUTO_WEIGHTS_ACTIVE = False  # any problem → shipped defaults stay active
 # Props - core functions are required, verdict_color is optional
 from props import hr_prob_per_pa, k_total_projection
 
