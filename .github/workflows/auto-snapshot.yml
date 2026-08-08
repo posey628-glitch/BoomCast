@@ -1,0 +1,81 @@
+name: Auto snapshot + grade (LaunchCast)
+
+# WHAT THIS DOES
+# The app already auto-snapshots today's slate and grades yesterday whenever it
+# LOADS (once per hour, for today's date). The only thing missing was something
+# to load it on a schedule so YOU don't have to. This job does exactly that:
+# it "wakes" the app by loading its URL at set times, which triggers the app's
+# own proven snapshot+grade pipeline (saving to the durable Gist). No data logic
+# lives here — it just knocks on the door so the app runs itself.
+#
+# SCHEDULE (times are UTC; cron can't do timezones). Adjust the hours to your
+# needs. Defaults below aim at:
+#   - a few afternoon/evening ET pings to catch lineups as they post
+#   - a morning ET ping to grade yesterday's completed games
+# MLB lineups usually post 3-5 hours before first pitch; multiple evening pings
+# catch both early and late slates.
+
+on:
+  schedule:
+    # ── AFTERNOON slate coverage (day games ~1pm ET first pitch) ──
+    # 15:00 UTC = 11am ET  (afternoon-game lineups post + GRADE yesterday)
+    - cron: "0 15 * * *"
+    # 16:30 UTC = 12:30pm ET  (final confirmed lineups before 1pm games)
+    - cron: "30 16 * * *"
+    # ── EVENING slate coverage (most games 6:40-7:10pm ET) ──
+    # 20:00 UTC = 4pm ET  (early evening lineups start posting)
+    - cron: "0 20 * * *"
+    # 22:00 UTC = 6pm ET  (most evening lineups now confirmed)
+    - cron: "0 22 * * *"
+    # 23:00 UTC = 7pm ET  (last confirmations before first pitch)
+    - cron: "0 23 * * *"
+    # ── LATE / WEST-COAST coverage (games to ~10pm ET) ──
+    # 01:00 UTC = 9pm ET  (west-coast lineups confirmed)
+    - cron: "0 1 * * *"
+    # 02:30 UTC = 10:30pm ET  (final full-slate capture — every game locked)
+    - cron: "30 2 * * *"
+  # lets you run it by hand from the Actions tab too
+  workflow_dispatch:
+
+jobs:
+  wake-app:
+    runs-on: ubuntu-latest
+    # v46.54: hard cap so a slow/unresponsive app can NEVER burn 15 min again.
+    # A failed fast ping is harmless — the next scheduled ping retries. If this
+    # trips repeatedly, the APP itself is slow/down (check it in a browser), not
+    # the workflow.
+    timeout-minutes: 6
+    steps:
+      - name: Wake the app (triggers its auto-snapshot + grade)
+        env:
+          APP_URL: ${{ secrets.APP_URL }}
+        run: |
+          if [ -z "$APP_URL" ]; then
+            echo "ERROR: APP_URL secret is not set. Add it in repo Settings →"
+            echo "Secrets and variables → Actions → New repository secret."
+            exit 1
+          fi
+          echo "Waking app at $APP_URL"
+          # Streamlit Cloud apps sleep when idle; the FIRST hit wakes them and
+          # can take 30-60s to fully boot. We hit it, wait, then hit again to
+          # ensure the app fully loaded and ran its pipeline.
+          for attempt in 1 2 3; do
+            echo "--- wake attempt $attempt ---"
+            code=$(curl -s -o /dev/null -w "%{http_code}" -L --max-time 120 "$APP_URL" || echo "000")
+            echo "HTTP status: $code"
+            if [ "$code" = "200" ]; then
+              echo "App responded OK. Waiting 90s for it to finish loading + snapshotting…"
+              sleep 90
+              # a second load ensures the pipeline completed even if the first
+              # hit only started the wake-from-sleep
+              curl -s -o /dev/null -L --max-time 120 "$APP_URL" || true
+              echo "Done."
+              exit 0
+            fi
+            echo "Not ready yet, waiting 45s before retry…"
+            sleep 45
+          done
+          echo "WARNING: app did not return 200 after 3 attempts. It may still"
+          echo "have woken and snapshotted — check the app's backtest history."
+          # don't fail the whole job on a flaky wake; the app may still have run
+          exit 0
