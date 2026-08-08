@@ -567,9 +567,47 @@ def pitcher_grade_sort_key(grade):
     return order.get(grade, 99)
 
 # ────────────────────────────────────────────────────────────────────────────
+# LaunchCast 2.0 auto-reweight override.
+# DINGER_BASE_WEIGHTS is the shipped default. _ACTIVE_DINGER_WEIGHTS is what
+# scoring ACTUALLY uses — it defaults to the shipped constant, but can be
+# overridden at startup with evidence-driven auto-applied weights loaded from
+# the durable gist (see auto_reweight.load_live_weights + set_active_dinger_weights).
+# If anything about the override is wrong, we ALWAYS fall back to the constant,
+# so scoring can never break or use garbage weights.
+_ACTIVE_DINGER_WEIGHTS = dict(DINGER_BASE_WEIGHTS)
+
+
+def set_active_dinger_weights(weights) -> bool:
+    """Override the live dinger weights (called once at startup with gist-loaded
+    auto-applied weights). Bulletproof: rejects anything that isn't a clean dict
+    with the SAME keys as the shipped default and all-positive finite values —
+    on any problem it leaves the safe default in place and returns False."""
+    global _ACTIVE_DINGER_WEIGHTS
+    try:
+        if not isinstance(weights, dict):
+            return False
+        if set(weights.keys()) != set(DINGER_BASE_WEIGHTS.keys()):
+            return False
+        clean = {}
+        for k, v in weights.items():
+            fv = float(v)
+            if not (fv > 0) or fv != fv or fv in (float("inf"), float("-inf")):
+                return False
+            clean[k] = fv
+        _ACTIVE_DINGER_WEIGHTS = clean
+        return True
+    except Exception:
+        return False
+
+
+def active_dinger_weights() -> dict:
+    """Return the weights scoring is currently using (default or auto-applied)."""
+    return dict(_ACTIVE_DINGER_WEIGHTS)
+
+
 def _dinger_base_percentile(df: "pd.DataFrame") -> "pd.Series":
     """Percentile-ranked raw power base (0-100), per-row NaN-renormalized."""
-    present = [(c, w) for c, w in DINGER_BASE_WEIGHTS.items() if c in df.columns]
+    present = [(c, w) for c, w in _ACTIVE_DINGER_WEIGHTS.items() if c in df.columns]
     if not present:
         return pd.Series(np.nan, index=df.index)
     num = pd.Series(0.0, index=df.index)
