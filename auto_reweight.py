@@ -100,17 +100,30 @@ def maybe_auto_reweight(gist_read_all, gist_write_all, importance_df,
             return status
 
         feats = proposal.get("features", {})
+
+        def _ev(d, key, default=0.0):
+            # propose_dinger_weights nests corr/reliability/days under 'evidence';
+            # delta/proposed/current are top-level. Read from whichever holds it,
+            # so this is robust to either structure. (Sweep-caught: reading these
+            # at top level always got 0 → the bar could NEVER be met.)
+            if key in ("delta", "proposed", "current", "apply"):
+                return d.get(key, default)
+            ev = d.get("evidence")
+            if isinstance(ev, dict) and key in ev and ev[key] is not None:
+                return ev[key]
+            return d.get(key, default)
+
         # GUARD 1 + 2: every DRIVING feature (nonzero delta) must clear days + reliability
-        drivers = {f: d for f, d in feats.items() if abs(d.get("delta", 0.0)) > 1e-6}
+        drivers = {f: d for f, d in feats.items() if abs(_ev(d, "delta", 0.0)) > 1e-6}
         if not drivers:
             status["reason"] = "no meaningful deltas proposed"
             return status
         for f, d in drivers.items():
-            if int(d.get("days", 0)) < AUTO_MIN_DAYS:
-                status["reason"] = f"{f}: only {d.get('days',0)}d evidence (< {AUTO_MIN_DAYS})"
+            if int(_ev(d, "days", 0)) < AUTO_MIN_DAYS:
+                status["reason"] = f"{f}: only {_ev(d,'days',0)}d evidence (< {AUTO_MIN_DAYS})"
                 return status
-            if float(d.get("reliability", 0.0)) < AUTO_MIN_RELIABILITY:
-                status["reason"] = f"{f}: reliability {d.get('reliability',0):.2f} < {AUTO_MIN_RELIABILITY}"
+            if float(_ev(d, "reliability", 0.0)) < AUTO_MIN_RELIABILITY:
+                status["reason"] = f"{f}: reliability {_ev(d,'reliability',0):.2f} < {AUTO_MIN_RELIABILITY}"
                 return status
 
         # Compute a QUARTER-step (GUARD 4) with per-feature + total caps (GUARD 5)
@@ -118,7 +131,7 @@ def maybe_auto_reweight(gist_read_all, gist_write_all, importance_df,
         moves = {}
         for f, d in drivers.items():
             cur = float(current_live_weights.get(f, 0.0))
-            proposed = float(d.get("proposed", cur))
+            proposed = float(_ev(d, "proposed", cur))
             full_step = proposed - cur
             step = full_step * AUTO_STEP_FRACTION
             # cap per-feature move
@@ -150,9 +163,9 @@ def maybe_auto_reweight(gist_read_all, gist_write_all, importance_df,
             "prior_weights": dict(current_live_weights),
             "new_weights": dict(new_w),
             "moves": {f: round(s, 4) for f, s in moves.items()},
-            "evidence": {f: {"days": drivers[f].get("days"),
-                             "reliability": round(float(drivers[f].get("reliability", 0)), 3),
-                             "corr": round(float(drivers[f].get("corr", 0)), 4)}
+            "evidence": {f: {"days": _ev(drivers[f], "days", 0),
+                             "reliability": round(float(_ev(drivers[f], "reliability", 0)), 3),
+                             "corr": round(float(_ev(drivers[f], "corr", 0)), 4)}
                          for f in moves},
             "bar": {"min_days": AUTO_MIN_DAYS, "min_reliab": AUTO_MIN_RELIABILITY,
                     "step_frac": AUTO_STEP_FRACTION, "cooldown_days": AUTO_COOLDOWN_DAYS},
