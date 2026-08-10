@@ -5334,6 +5334,32 @@ if show_pattern_analysis:
                             f"across {rf_results.get('n_total', 0)} player-games."
                         )
 
+                        # HEADLINE: unified tier scoreboard — which STABLE tiers
+                        # actually produce a higher HR rate, ranked by lift. This
+                        # is the daily at-a-glance view (vs the churny top-10):
+                        # tiers don't reshuffle on lineup confirmation the way a
+                        # ranked cutoff does, so this is what to read every day.
+                        try:
+                            from pattern_analysis import tier_summary_table
+                            _tier_tbl = tier_summary_table(rf_results)
+                            if not _tier_tbl.empty:
+                                st.markdown("#### 🎯 Tier Scoreboard — which cohorts actually homer more")
+                                st.caption(
+                                    "Ranked by lift (in-tier HR rate ÷ out-of-tier). "
+                                    "Lift > 1 = the tier picks homers better than the field. "
+                                    "Stable tiers to watch daily instead of the shifting top-10."
+                                )
+                                st.dataframe(
+                                    _tier_tbl, use_container_width=True, hide_index=True,
+                                    column_config={
+                                        "Lift": st.column_config.NumberColumn("Lift", format="%.2fx"),
+                                        "In HR%": st.column_config.NumberColumn("In HR%", format="%.1f%%"),
+                                        "Out HR%": st.column_config.NumberColumn("Out HR%", format="%.1f%%"),
+                                    },
+                                )
+                        except Exception:
+                            pass  # non-fatal — the detailed per-tier blocks still render below
+
                         mh = rf_results.get("must_have", {})
                         if mh:
                             n_pass = mh.get("n_pass", 0)
