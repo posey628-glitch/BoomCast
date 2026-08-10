@@ -374,6 +374,58 @@ def calibration_drift(merged_df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================================
 # Researcher's framework backtest — do Must-Have/Nuclear passers homer more?
 # ============================================================================
+def tier_summary_table(rf_results: dict) -> "pd.DataFrame":
+    """Normalize every graded tier from researcher_framework_backtest into ONE
+    at-a-glance table, ranked by lift. This is the daily headline: instead of an
+    ever-shifting top-10, see which STABLE tiers (Must-Have, Nuclear, Elite
+    Convergence, Perfect Storm) actually produce a higher HR rate — and by how
+    much — so you know which cohorts are real signal vs vanity.
+
+    Columns: Tier | In-tier N | In HR% | Out HR% | Lift | Reliable
+    Rows with no data are skipped. Sorted by lift (best first).
+    """
+    import pandas as pd
+    if not isinstance(rf_results, dict) or rf_results.get("error"):
+        return pd.DataFrame()
+
+    rows = []
+
+    def _add(label, n_in, in_rate, out_rate, lift, reliable):
+        if n_in is None or in_rate is None:
+            return
+        rows.append({
+            "Tier": label,
+            "In-tier N": int(n_in),
+            "In HR%": round(in_rate * 100, 1),
+            "Out HR%": round(out_rate * 100, 1) if out_rate is not None else None,
+            "Lift": round(lift, 2) if lift is not None else None,
+            "Reliable": "✓" if reliable else "small n",
+        })
+
+    # Must-Have (different key shape: n_pass/pass_hr_rate)
+    mh = rf_results.get("must_have") or {}
+    if mh:
+        _add("Must-Have", mh.get("n_pass"), mh.get("pass_hr_rate"),
+             mh.get("fail_hr_rate"), mh.get("lift"), mh.get("reliable"))
+
+    # Consistent in/out shape tiers
+    for key, label in [("nuclear", "Nuclear"),
+                       ("elite_convergence", "Elite Convergence"),
+                       ("perfect_storm", "Perfect Storm")]:
+        t = rf_results.get(key) or {}
+        if t:
+            _add(label, t.get("n_in"), t.get("in_hr_rate"),
+                 t.get("out_hr_rate"), t.get("lift"), t.get("reliable"))
+
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    # sort by lift (best first); None lift sinks to bottom
+    df["_sort"] = df["Lift"].fillna(-1)
+    df = df.sort_values("_sort", ascending=False).drop(columns="_sort").reset_index(drop=True)
+    return df
+
+
 def researcher_framework_backtest(merged_df: pd.DataFrame) -> dict:
     """Compare HR rate of Must-Have passers, Nuclear-tier hitters, and the rest.
 
@@ -531,6 +583,41 @@ def researcher_framework_backtest(merged_df: pd.DataFrame) -> dict:
             ),
             "reliable": len(ec_in) >= 20,  # elite cohort is small by design
             "threshold_note": "HR≥80, Dinger≥80, Combo≥78, BrlMatch≥80, TwoWay≥75",
+        }
+
+    # (user-requested: grade the PERFECT STORM tier). Perfect Storm = Consensus
+    # hitter × EXPLOIT/EXPLOIT+ pitcher × real pitcher vulnerability (hr9 or
+    # barrel-allowed) × favorable env. It's a headline tier the app SHOWS, but
+    # until now it was never GRADED — so we didn't know if it actually predicts
+    # HRs. This mirrors the display rule (app.py Perfect Storm section) exactly,
+    # so the backtest measures the same cohort the user sees.
+    if all(c in merged_df.columns for c in ["opp_pitcher_grade", "hr_game_pct", "homered"]):
+        ps = merged_df.dropna(subset=["homered"]).copy()
+        _ps_mask = (
+            ps["opp_pitcher_grade"].isin(["EXPLOIT", "EXPLOIT+"])
+            & (pd.to_numeric(ps["hr_game_pct"], errors="coerce").fillna(0) >= 14)
+        )
+        _vuln = pd.Series(False, index=ps.index)
+        if "opp_pitcher_hr9" in ps.columns:
+            _vuln = _vuln | (pd.to_numeric(ps["opp_pitcher_hr9"], errors="coerce").fillna(0) >= 1.2)
+        if "opp_pitcher_barrel_allowed" in ps.columns:
+            _vuln = _vuln | (pd.to_numeric(ps["opp_pitcher_barrel_allowed"], errors="coerce").fillna(0) >= 7.5)
+        _ps_mask = _ps_mask & _vuln
+        if "env_boost" in ps.columns:
+            _ps_mask = _ps_mask & (pd.to_numeric(ps["env_boost"], errors="coerce").fillna(1.0) >= 1.00)
+        ps_in = ps[_ps_mask.fillna(False)]
+        ps_out = ps[~_ps_mask.fillna(False)]
+        result["perfect_storm"] = {
+            "n_in": len(ps_in),
+            "n_out": len(ps_out),
+            "in_hr_rate": float(ps_in["homered"].mean()) if len(ps_in) else None,
+            "out_hr_rate": float(ps_out["homered"].mean()) if len(ps_out) else None,
+            "lift": (
+                float(ps_in["homered"].mean() / ps_out["homered"].mean())
+                if len(ps_in) and len(ps_out) and ps_out["homered"].mean() > 0
+                else None
+            ),
+            "reliable": len(ps_in) >= 15,  # storm cohort is small + strict by design
         }
 
     # v44.67 (user: pattern-analyze day/night + home/away). Segment the slate
