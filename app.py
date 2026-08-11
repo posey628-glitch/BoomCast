@@ -20868,6 +20868,26 @@ if owner_mode:
             "column-coverage assertions, silent scoring errors. "
             "⚠️ icon = at least one issue this run."
         )
+        # Backup source status — api-sports.io (baseball) as a fallback if the
+        # primary MLB sources ever fail. Shows availability + your daily quota
+        # (free tier is 100 req/day shared across sports), so the backup is a
+        # KNOWN quantity before it's ever needed.
+        try:
+            from apisports_backup import apisports_key_present, apisports_baseball_status
+            st.markdown("**Backup source (api-sports.io baseball):**")
+            if not apisports_key_present():
+                st.caption("• No api-sports key set — add `apisports_key` to secrets to enable the backup.")
+            else:
+                _st_status = apisports_baseball_status()
+                if _st_status.get("available"):
+                    _used = _st_status.get("requests_used_today")
+                    _lim = _st_status.get("daily_limit")
+                    st.caption(f"• ✅ Reachable. Quota today: {_used}/{_lim} used "
+                               f"(plan: {_st_status.get('plan')}).")
+                else:
+                    st.caption(f"• ⚠️ Not reachable: {_st_status.get('reason')}")
+        except Exception:
+            pass
         # v45.85: use the shared helper so the on-screen panel and the copy
         # text are always identical (they were computed separately before, and
         # the copy text omitted this whole block).
