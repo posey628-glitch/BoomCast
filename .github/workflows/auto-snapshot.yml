@@ -30,8 +30,13 @@ on:
     # 23:00 UTC = 7pm ET  (last confirmations before first pitch)
     - cron: "0 23 * * *"
     # ── LATE / WEST-COAST coverage (games to ~10pm ET) ──
+    # 00:15 UTC = 8:15pm ET  (closes the 7→9pm gap — west-coast lineups FIRST
+    #   post ~7:30-8:30pm ET; without this they sat uncaptured until 9pm)
+    - cron: "15 0 * * *"
     # 01:00 UTC = 9pm ET  (west-coast lineups confirmed)
     - cron: "0 1 * * *"
+    # 01:30 UTC = 9:30pm ET  (late-scratch insurance before ~10:10pm first pitch)
+    - cron: "30 1 * * *"
     # 02:30 UTC = 10:30pm ET  (final full-slate capture — every game locked)
     - cron: "30 2 * * *"
   # lets you run it by hand from the Actions tab too
