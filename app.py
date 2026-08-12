@@ -190,6 +190,87 @@ def _confirmed_only_for_snapshot(df):
         return df
 
 
+def _get_manual_excludes() -> set:
+    """v46.57 (user-requested): the owner's manual exclude list for TODAY.
+    When the news says a player is out before MLB's roster feed catches up (e.g.
+    a late IL move), the owner can exclude them by name. Stored in session_state,
+    keyed by name (lowercased). Returns a set of lowercased names to drop.
+
+    Applied at BOTH the combined_all choke-point (so excluded players never reach
+    the snapshot / pattern analysis / backtest) AND the pick pool (so the Top-10
+    does automatic 'next man up' — the greedy selector just fills from whoever
+    remains). One list, every consumer honors it."""
+    try:
+        import streamlit as st
+        raw = st.session_state.get("_manual_exclude_names", set())
+        return {str(n).strip().lower() for n in raw if str(n).strip()}
+    except Exception:
+        return set()
+
+
+def _apply_manual_excludes(df):
+    """Drop any row whose player_name is in the owner's manual exclude list.
+    Safe: no name column or empty list → returns df unchanged. Never raises."""
+    try:
+        excl = _get_manual_excludes()
+        if not excl or df is None or getattr(df, "empty", True):
+            return df
+        if "player_name" not in df.columns:
+            return df
+        import pandas as _pd
+        _names = df["player_name"].fillna("").astype(str).str.strip().str.lower()
+        keep = ~_names.isin(excl)
+        return df[keep]
+    except Exception:
+        return df
+
+
+def _get_list_hides(list_key: str) -> set:
+    """v46.58 (user-requested): PER-LIST cosmetic hide. Unlike the global exclude
+    (which removes a not-playing player from EVERYTHING incl. pattern analysis),
+    this only hides a STILL-PLAYING player from ONE display. It NEVER touches the
+    snapshot / pattern analysis / backtest — because the player IS playing, so
+    their data stays valid. Each list has its own independent hide set, so hiding
+    someone from one list can't affect any other list.
+
+    list_key: e.g. 'top10', 'power', 'sleepers'. Returns lowercased names to hide.
+    """
+    try:
+        import streamlit as st
+        store = st.session_state.get("_list_hides", {})
+        raw = store.get(list_key, set())
+        return {str(n).strip().lower() for n in raw if str(n).strip()}
+    except Exception:
+        return set()
+
+
+def _apply_list_hide(df, list_key: str):
+    """Cosmetically hide names from ONE list's display only. Safe + isolated:
+    operates on a per-list key, so it can't leak into other lists or the data."""
+    try:
+        hides = _get_list_hides(list_key)
+        if not hides or df is None or getattr(df, "empty", True):
+            return df
+        if "player_name" not in df.columns:
+            return df
+        _names = df["player_name"].fillna("").astype(str).str.strip().str.lower()
+        return df[~_names.isin(hides)]
+    except Exception:
+        return df
+
+
+def _get_manual_adds() -> list:
+    """v46.58 (user-requested): owner-inserted players confirmed to be playing
+    BEFORE the lineup feed loads them. Lets you get a real, accurate row in early
+    for a guy you KNOW is starting. Stored as a list of dicts with at least
+    'player_name' and 'team'. Returns [] if none."""
+    try:
+        import streamlit as st
+        return list(st.session_state.get("_manual_add_players", []))
+    except Exception:
+        return []
+
+
 # Core imports - make each one defensive so a single missing function
 # doesn't kill the whole app
 try:
@@ -12552,11 +12633,16 @@ if combined_picks is not None and not combined_picks.empty:
         # appear (flagged 🏥) in the matchup tables for visibility; they just
         # don't rank in the picks you actually bet.
         _q_pool = q
+        # v46.57 (user-requested): manual exclude FIRST — removing a player here
+        # means the greedy Top-10 selector below automatically pulls the next
+        # eligible player up ("next man up"), shifting the rest of the picks to
+        # fill the gap. No hole is left behind.
+        _q_pool = _apply_manual_excludes(_q_pool)
         if "il_flag" in q.columns:
-            _active_mask = q["il_flag"].fillna("").astype(str) == ""
+            _active_mask = _q_pool["il_flag"].fillna("").astype(str) == ""
             _n_excluded = int((~_active_mask).sum())
             if _n_excluded > 0:
-                _q_pool = q[_active_mask]
+                _q_pool = _q_pool[_active_mask]
                 try:
                     stash_diagnostic(
                         "pipeline_health",
@@ -12746,6 +12832,18 @@ if combined_picks is not None and not combined_picks.empty:
             "arsenal_flag", "gb_flag", "split_confidence", "data_completeness", "il_flag",
         ] if c in top10.columns]
         disp = top10[cols_to_show].copy()
+
+        # v46.58 (user-requested): per-list COSMETIC hide — remove names the owner
+        # chose to hide from THIS view only. Applied to `disp` (the display copy),
+        # NOT top10/combined_all, so it NEVER affects the snapshot, pattern
+        # analysis, or any other list. Re-number rank so there's no visual gap.
+        try:
+            disp = _apply_list_hide(disp, "top10")
+            if "rank" in disp.columns:
+                disp = disp.reset_index(drop=True)
+                disp["rank"] = range(1, len(disp) + 1)
+        except Exception:
+            pass
 
         # v45.35: band tinting on the marquee — subtle cell backgrounds per
         # METRIC_BANDS for every banded column present. Styler works alongside
@@ -12979,6 +13077,134 @@ if combined_picks is not None and not combined_picks.empty:
                     )
         except Exception:
             pass
+
+        # v46.57 (user-requested): owner tool to manually exclude a player when
+        # the news says they're out before MLB's roster feed catches up. Excluded
+        # players are removed from picks, the projected table, the snapshot, and
+        # pattern analysis — and the Top-10 auto-fills the gap (next man up).
+        if owner_mode:
+            with st.expander("🚫 Manually exclude players (late injury/scratch news)", expanded=False):
+                st.caption(
+                    "If you know a player is OUT before MLB's feed updates, exclude "
+                    "them here. They're dropped from picks, the projected list, the "
+                    "snapshot, and pattern analysis. The Top-10 fills the gap "
+                    "automatically (next man up). Resets each day."
+                )
+                _cur = sorted(st.session_state.get("_manual_exclude_names", set()))
+                # add a name
+                _add_col, _btn_col = st.columns([3, 1])
+                with _add_col:
+                    _new_name = st.text_input(
+                        "Player name to exclude (exact, as shown in picks)",
+                        key="_manual_excl_input", label_visibility="collapsed",
+                        placeholder="e.g. James Wood",
+                    )
+                with _btn_col:
+                    if st.button("Exclude", key="_manual_excl_add", use_container_width=True):
+                        if _new_name and _new_name.strip():
+                            _s = st.session_state.get("_manual_exclude_names", set())
+                            _s = set(_s); _s.add(_new_name.strip())
+                            st.session_state["_manual_exclude_names"] = _s
+                            st.rerun()
+                # show + clear current list
+                if _cur:
+                    st.markdown("**Currently excluded today:**")
+                    for _nm in _cur:
+                        _rc1, _rc2 = st.columns([4, 1])
+                        _rc1.write(f"🚫 {_nm}")
+                        if _rc2.button("Undo", key=f"_unexcl_{_nm}", use_container_width=True):
+                            _s = set(st.session_state.get("_manual_exclude_names", set()))
+                            _s.discard(_nm)
+                            st.session_state["_manual_exclude_names"] = _s
+                            st.rerun()
+                    if st.button("Clear all excludes", key="_manual_excl_clear"):
+                        st.session_state["_manual_exclude_names"] = set()
+                        st.rerun()
+                else:
+                    st.caption("No manual excludes set today.")
+
+            # v46.58 (user-requested): TOOL B — cosmetic hide from THIS list only.
+            # Distinct from the global exclude above: use this for a player who IS
+            # playing but you just don't want to see in the Top-10. It does NOT
+            # touch pattern analysis or any other list (the player's data stays
+            # valid because they're actually playing).
+            with st.expander("🙈 Hide from Top-10 view only (cosmetic — still played, still counts)", expanded=False):
+                st.caption(
+                    "Hides a player from THIS Top-10 table only. Unlike the exclude "
+                    "tool, it does NOT remove them from other lists, the snapshot, "
+                    "or pattern analysis — use it only for players who ARE playing. "
+                    "The list re-numbers to fill the gap."
+                )
+                _hc1, _hc2 = st.columns([3, 1])
+                with _hc1:
+                    _hide_name = st.text_input(
+                        "Player to hide from Top-10", key="_top10_hide_input",
+                        label_visibility="collapsed", placeholder="e.g. a player you're fading",
+                    )
+                with _hc2:
+                    if st.button("Hide", key="_top10_hide_add", use_container_width=True):
+                        if _hide_name and _hide_name.strip():
+                            _store = dict(st.session_state.get("_list_hides", {}))
+                            _s = set(_store.get("top10", set())); _s.add(_hide_name.strip())
+                            _store["top10"] = _s
+                            st.session_state["_list_hides"] = _store
+                            st.rerun()
+                _cur_hides = sorted(st.session_state.get("_list_hides", {}).get("top10", set()))
+                if _cur_hides:
+                    st.markdown("**Hidden from Top-10 today:**")
+                    for _hn in _cur_hides:
+                        _hrc1, _hrc2 = st.columns([4, 1])
+                        _hrc1.write(f"🙈 {_hn}")
+                        if _hrc2.button("Unhide", key=f"_unhide_top10_{_hn}", use_container_width=True):
+                            _store = dict(st.session_state.get("_list_hides", {}))
+                            _s = set(_store.get("top10", set())); _s.discard(_hn)
+                            _store["top10"] = _s
+                            st.session_state["_list_hides"] = _store
+                            st.rerun()
+
+            # v46.58 (user-requested): TOOL C — manually ADD a confirmed player to
+            # the game-by-game matchups before the lineup feed loads them, so you
+            # get a real row in early for someone you KNOW is starting.
+            with st.expander("➕ Add a confirmed player early (before the feed loads them)", expanded=False):
+                st.caption(
+                    "If you can see a player is confirmed in a lineup before the app "
+                    "loads it, add them here so their matchup row appears early. "
+                    "This is a display aid — once the real feed catches up it takes "
+                    "over. Resets daily."
+                )
+                _ac1, _ac2, _ac3 = st.columns([2, 2, 1])
+                with _ac1:
+                    _add_name = st.text_input("Player name", key="_manual_add_name",
+                                              label_visibility="collapsed", placeholder="Player name")
+                with _ac2:
+                    _add_team = st.text_input("Team abbr", key="_manual_add_team",
+                                              label_visibility="collapsed", placeholder="Team (e.g. WSH)")
+                with _ac3:
+                    if st.button("Add", key="_manual_add_btn", use_container_width=True):
+                        if _add_name and _add_name.strip() and _add_team and _add_team.strip():
+                            _adds = list(st.session_state.get("_manual_add_players", []))
+                            _adds.append({"player_name": _add_name.strip(),
+                                          "team": _add_team.strip().upper()})
+                            st.session_state["_manual_add_players"] = _adds
+                            st.rerun()
+                _cur_adds = st.session_state.get("_manual_add_players", [])
+                if _cur_adds:
+                    st.markdown("**Manually added today:**")
+                    for _i, _ap in enumerate(list(_cur_adds)):
+                        _arc1, _arc2 = st.columns([4, 1])
+                        _arc1.write(f"➕ {_ap.get('player_name')} ({_ap.get('team')})")
+                        if _arc2.button("Remove", key=f"_unadd_{_i}", use_container_width=True):
+                            _adds = list(st.session_state.get("_manual_add_players", []))
+                            _adds = [a for a in _adds if not (
+                                a.get("player_name") == _ap.get("player_name")
+                                and a.get("team") == _ap.get("team"))]
+                            st.session_state["_manual_add_players"] = _adds
+                            st.rerun()
+                    st.caption(
+                        "⚠️ Note: manually added players show a projected row from "
+                        "their season stats until the real lineup feed loads them "
+                        "with confirmed matchup data."
+                    )
 
         # v44.51 (user-requested): copy the Top 10 as text.
         with st.expander("📋 Copy Top 10 as text", expanded=False):
@@ -14698,6 +14924,27 @@ if all_hitters:
     except Exception:
         pass  # never let the filter crash the slate build
 
+    # v46.57 (user-requested): apply the owner's manual exclude list at the SAME
+    # choke-point, so a player the owner knows is out (before MLB's feed catches
+    # up) is removed from the snapshot, pattern analysis, backtest, and every
+    # display at once — the single source that feeds them all.
+    try:
+        _before = len(combined_all)
+        combined_all = _apply_manual_excludes(combined_all).reset_index(drop=True)
+        _excl_n = _before - len(combined_all)
+        if _excl_n > 0:
+            try:
+                stash_diagnostic(
+                    "pipeline_health",
+                    f"Manually excluded {_excl_n} player(s) from the slate "
+                    f"(owner override — e.g. late injury news).",
+                    level="caption",
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     # v46.19: apply the stranded convergence_count (computed on the q/picks copy)
     # onto combined_all by player_id so it reaches the snapshot and can be graded.
     try:
@@ -15634,6 +15881,17 @@ if all_hitters:
                     f"{', '.join(flagged_names[:10])}"
                     + (f" +{len(flagged_names)-10} more" if len(flagged_names) > 10 else "")
                     + f"\n\n{coverage_msg}"
+                )
+            elif teams_loaded < teams_total:
+                # v46.57 (user-flagged: injured players slipping into picks): when
+                # rosters PARTIALLY fail, injured hitters from the unloaded teams
+                # can't be flagged and may appear in the Top-10. Make this a LOUD
+                # warning (not a quiet caption) so you know to verify manually /
+                # use the manual-exclude tool above.
+                st.warning(
+                    f"⚠️ **Injury flags may be incomplete.** {coverage_msg} "
+                    f"Some injured players could appear in picks — use the "
+                    f"'🚫 Manually exclude players' tool if you spot one."
                 )
             else:
                 st.caption(coverage_msg)
