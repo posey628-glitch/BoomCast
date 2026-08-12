@@ -153,6 +153,43 @@ def _calibration_snapshot() -> dict:
     }
 
 
+def _confirmed_only_for_snapshot(df):
+    """v46.56 (user-flagged: projected players polluting pattern analysis).
+    The snapshot feeds backtesting + pattern discovery, which grade each row
+    against actual MLB outcomes. A PROJECTED player (lineup not confirmed) who
+    then sits gets graded as a false 'did not homer' — polluting the learning
+    data with an outcome he never had the chance to earn. So the snapshot must
+    contain ONLY confirmed starters.
+
+    Drops any row that is bench, roster-fill, or on an unconfirmed lineup. Safe:
+    if the confirmation columns are absent (old code paths), returns df unchanged
+    rather than risk dropping everything. Never raises."""
+    try:
+        import pandas as _pd
+        if df is None or getattr(df, "empty", True):
+            return df
+        keep = _pd.Series(True, index=df.index)
+        if "lineup_confirmed" in df.columns:
+            keep &= df["lineup_confirmed"].fillna(False).astype(bool)
+        else:
+            # no confirmation info → don't gamble on dropping everything
+            return df
+        if "is_bench" in df.columns:
+            keep &= ~df["is_bench"].fillna(False).astype(bool)
+        if "is_roster_fill" in df.columns:
+            keep &= ~df["is_roster_fill"].fillna(False).astype(bool)
+        filtered = df[keep]
+        # guard: if the filter would empty a non-empty slate (e.g. no lineups
+        # posted yet at save time), keep the original so we don't save a blank
+        # snapshot — better to grade nothing than to lose the day entirely, and
+        # the grader itself only scores players with real outcomes anyway.
+        if filtered.empty and not df.empty:
+            return df
+        return filtered
+    except Exception:
+        return df
+
+
 # Core imports - make each one defensive so a single missing function
 # doesn't kill the whole app
 try:
@@ -12531,6 +12568,27 @@ if combined_picks is not None and not combined_picks.empty:
                 except Exception:
                     pass
 
+        # v46.56 (user-flagged: projected players like Wood/Basallo appearing in
+        # the Top-10 when they didn't start). Split the pool into CONFIRMED
+        # starters vs PROJECTED (lineup not posted yet). The Top-10 marquee is
+        # built from CONFIRMED only; projected players are surfaced in a separate
+        # "Projected (lineups pending)" table below so a guess is never shown as a
+        # confirmed top play. Before any lineups post, confirmed is empty and the
+        # projected table carries the early-day picks — nothing is lost, just
+        # honestly labeled.
+        _q_projected = _q_pool.iloc[0:0]  # empty frame with same columns
+        try:
+            if "lineup_confirmed" in _q_pool.columns:
+                _conf_mask = _q_pool["lineup_confirmed"].fillna(False).astype(bool)
+                if "is_bench" in _q_pool.columns:
+                    _conf_mask &= ~_q_pool["is_bench"].fillna(False).astype(bool)
+                if "is_roster_fill" in _q_pool.columns:
+                    _conf_mask &= ~_q_pool["is_roster_fill"].fillna(False).astype(bool)
+                _q_projected = _q_pool[~_conf_mask]
+                _q_pool = _q_pool[_conf_mask]
+        except Exception:
+            _q_projected = _q_pool.iloc[0:0]
+
         # Diversity rule: max 2 picks per game so the top 5 doesn't pile up
         # on one matchup. Greedy selection: sort by pick_score, take in order,
         # skipping any that would exceed 2-per-game.
@@ -12890,6 +12948,37 @@ if combined_picks is not None and not combined_picks.empty:
                 ),
             },
         )
+
+        # v46.56 (user-flagged): PROJECTED players — lineup not yet posted for
+        # their game. Kept SEPARATE from the confirmed Top-10 above so a guess is
+        # never shown as a confirmed play. Before lineups post this carries the
+        # early-day picks; once a game's lineup is confirmed, its non-starters
+        # vanish from here too (they're filtered upstream). These are NOT graded
+        # in pattern analysis — only confirmed starters feed the snapshot.
+        try:
+            if _q_projected is not None and not _q_projected.empty:
+                _proj_sorted = _q_projected.sort_values("pick_score", ascending=False).head(10)
+                _proj_cols = [c for c in ["player_name", "team", "game", "opp_pitcher",
+                                          "hr_game_pct", "pick_score", "dinger_score"]
+                              if c in _proj_sorted.columns]
+                with st.expander(
+                    f"⏳ Projected plays — lineups pending ({len(_proj_sorted)}) "
+                    f"— NOT yet confirmed, not graded",
+                    expanded=False,
+                ):
+                    st.caption(
+                        "These players' lineups aren't posted yet, so they're "
+                        "PROJECTIONS, not confirmed plays. They're shown here "
+                        "separately (never mixed into the confirmed Top-10) and "
+                        "are excluded from pattern analysis until confirmed. Once "
+                        "a lineup posts, non-starters drop off automatically."
+                    )
+                    st.dataframe(
+                        _proj_sorted[_proj_cols].reset_index(drop=True),
+                        hide_index=True, use_container_width=True,
+                    )
+        except Exception:
+            pass
 
         # v44.51 (user-requested): copy the Top 10 as text.
         with st.expander("📋 Copy Top 10 as text", expanded=False):
@@ -16118,7 +16207,7 @@ if all_hitters:
                 "dropped_gamepks": st.session_state.get("_filter_dropped_gamepks", []) or [],
             }
             ok = save_snapshot(
-                selected_date, combined_all, p_slate,
+                selected_date, _confirmed_only_for_snapshot(combined_all), p_slate,
                 app_version=APP_VERSION,
                 calibration_constants=_calibration_snapshot(),
                 filter_bias_metadata=_bias_meta,
@@ -16185,7 +16274,7 @@ if all_hitters:
                     "dropped_gamepks": st.session_state.get("_filter_dropped_gamepks", []) or [],
                 }
                 ok = save_snapshot(
-                    selected_date, combined_all, p_slate,
+                    selected_date, _confirmed_only_for_snapshot(combined_all), p_slate,
                     app_version=APP_VERSION,
                     calibration_constants=_calibration_snapshot(),
                     filter_bias_metadata=_bias_meta_manual,
