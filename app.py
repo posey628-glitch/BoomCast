@@ -13161,15 +13161,23 @@ if combined_picks is not None and not combined_picks.empty:
                     "automatically (next man up). Pick as many as you want — this "
                     "saves and survives a page refresh. Resets daily."
                 )
-                # v46.59: dropdown of ACTUAL slate names → guaranteed match.
+                # v46.59/61: dropdown of ACTUAL slate names → guaranteed match.
+                # Source from BOTH combined_picks AND the wider `qualified` pool
+                # (stored in session_state as _exclude_name_pool) so every player
+                # shown in ANY list — including projected ones like Wood — is
+                # selectable here. This fixes names that appeared in the HR/Power/
+                # Sleepers section but were missing from the exclude dropdown.
                 _name_pool = []
                 try:
                     if combined_picks is not None and "player_name" in combined_picks.columns:
-                        _name_pool = sorted(
-                            combined_picks["player_name"].dropna().astype(str).str.strip().unique().tolist()
-                        )
+                        _name_pool = combined_picks["player_name"].dropna().astype(str).str.strip().tolist()
                 except Exception:
                     _name_pool = []
+                try:
+                    _name_pool += st.session_state.get("_exclude_name_pool", [])
+                except Exception:
+                    pass
+                _name_pool = sorted(set(n for n in _name_pool if n))
                 _cur_excl = sorted(st.session_state.get("_manual_exclude_names", set()))
                 # include any already-excluded names not in the current pool (e.g.
                 # a player already filtered out) so they stay selectable/removable.
@@ -16233,6 +16241,24 @@ if all_hitters:
         qualified = combined_all[combined_all["pa"].notna() & (combined_all["pa"] >= INSUFFICIENT_PA_THRESHOLD)]
     else:
         qualified = combined_all
+
+    # v46.61 (user-flagged: Wood/Basallo showing in the 3-column Top-10 HR/Power/
+    # Sleepers section, which reads from `qualified`). Belt-and-suspenders: apply
+    # the manual exclude here too, so an excluded player is gone from THESE lists
+    # regardless of pool timing. Also expose every `qualified` name to the exclude
+    # dropdown (via session_state) so every player you SEE is selectable there.
+    try:
+        qualified = _apply_manual_excludes(qualified)
+    except Exception:
+        pass
+    try:
+        import streamlit as _stx
+        if qualified is not None and "player_name" in qualified.columns:
+            _stx.session_state["_exclude_name_pool"] = sorted(
+                qualified["player_name"].dropna().astype(str).str.strip().unique().tolist()
+            )
+    except Exception:
+        pass
 
     # v46.38: HISTORICAL DATA VIEWER — the user asked "where do I view it?".
     # Shows the 3-yr priors + splits for tonight's hitters in one sortable table.
