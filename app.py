@@ -191,19 +191,31 @@ def _confirmed_only_for_snapshot(df):
 
 
 def _get_manual_excludes() -> set:
-    """v46.57 (user-requested): the owner's manual exclude list for TODAY.
-    When the news says a player is out before MLB's roster feed catches up (e.g.
-    a late IL move), the owner can exclude them by name. Stored in session_state,
-    keyed by name (lowercased). Returns a set of lowercased names to drop.
+    """v46.57/62: the manual exclude list for TODAY. Reads from BOTH the owner's
+    session_state AND the shared Gist, so an exclude the OWNER sets propagates to
+    EVERY user's app (not just the owner's browser). This is essential: excluding
+    injured James Wood must remove him for public visitors too, not only for the
+    owner who set it. The Gist is the shared source of truth; session_state is the
+    owner's in-progress edits (which are also saved to the Gist on change).
 
-    Applied at BOTH the combined_all choke-point (so excluded players never reach
-    the snapshot / pattern analysis / backtest) AND the pick pool (so the Top-10
-    does automatic 'next man up' — the greedy selector just fills from whoever
-    remains). One list, every consumer honors it."""
+    Cached briefly per-run via session_state so we don't hit the Gist repeatedly."""
     try:
         import streamlit as st
-        raw = st.session_state.get("_manual_exclude_names", set())
-        return {str(n).strip().lower() for n in raw if str(n).strip()}
+        names = set(st.session_state.get("_manual_exclude_names", set()))
+        # also read the shared Gist (what all users see), cached for this run
+        try:
+            _cache_key = "_manual_excludes_gist_cache"
+            if _cache_key in st.session_state:
+                names |= set(st.session_state[_cache_key])
+            else:
+                _di = st.session_state.get("_active_slate_date_iso", "")
+                if _di:
+                    _persisted = _load_manual_excludes_gist(_di)
+                    st.session_state[_cache_key] = list(_persisted)
+                    names |= set(_persisted)
+        except Exception:
+            pass
+        return {str(n).strip().lower() for n in names if str(n).strip()}
     except Exception:
         return set()
 
@@ -2088,6 +2100,14 @@ with st.sidebar:
         return _et.date()
 
     selected_date = st.date_input("Slate date", value=_default_slate_date())
+    # v46.62: expose the active slate date so _get_manual_excludes() can read the
+    # shared Gist for the right day (makes owner excludes apply to ALL users).
+    try:
+        st.session_state["_active_slate_date_iso"] = (
+            selected_date.isoformat() if hasattr(selected_date, "isoformat") else str(selected_date)
+        )
+    except Exception:
+        pass
 
     # v44.21 (user-requested): jump-menu near the TOP of the sidebar so
     # navigation is the first thing you reach. Pure HTML anchor links —
@@ -13197,6 +13217,8 @@ if combined_picks is not None and not combined_picks.empty:
                         _di = (selected_date.isoformat()
                                if hasattr(selected_date, "isoformat") else str(selected_date))
                         _save_manual_excludes_gist(_di, _selected)
+                        # refresh the shared-gist cache so the change reflects now
+                        st.session_state["_manual_excludes_gist_cache"] = list(_selected)
                     except Exception:
                         pass
                     st.rerun()
@@ -19345,6 +19367,15 @@ def render_matchup_section(matchup_df: pd.DataFrame, team_label: str):
     # EXPLOIT/EXPLOIT+ pitcher, making the signal meaningless.
     # Operate on a copy so we don't mutate the canonical matchup_df.
     matchup_df = matchup_df.copy()
+    # v46.61 (sweep: close the last display gap): the per-game matchup tables show
+    # matchup_df directly. combined_all (which feeds patterns/snapshot) is already
+    # filtered, so DATA is safe; this filters the DISPLAY so an excluded (injured/
+    # out) player also vanishes from the per-game view. Manually-added players are
+    # unaffected (they're not in the exclude list).
+    try:
+        matchup_df = _apply_manual_excludes(matchup_df)
+    except Exception:
+        pass
     if ("smash_spot" in matchup_df.columns
             and "hr_game_pct" in matchup_df.columns):
         try:
