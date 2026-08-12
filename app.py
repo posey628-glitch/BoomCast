@@ -10477,6 +10477,24 @@ for gpk, ctx in game_context_map.items():
 if all_hitters_for_picks:
     combined_picks = pd.concat(all_hitters_for_picks, ignore_index=True)
 
+    # v46.55 (user-flagged): same confirmed-non-starter filter as combined_all.
+    # combined_picks feeds the Top-10 marquee + pick tables and DELIBERATELY
+    # includes bench frames (for late-swap grading), so a confirmed scratch could
+    # otherwise appear in the top-10. Drop non-starters ONLY on games whose lineup
+    # is confirmed; keep projected players on games without a posted lineup yet.
+    try:
+        if not combined_picks.empty and "lineup_confirmed" in combined_picks.columns:
+            _lc = combined_picks["lineup_confirmed"].fillna(False).astype(bool)
+            _bench = (combined_picks["is_bench"].fillna(False).astype(bool)
+                      if "is_bench" in combined_picks.columns else False)
+            _fill = (combined_picks["is_roster_fill"].fillna(False).astype(bool)
+                     if "is_roster_fill" in combined_picks.columns else False)
+            _drop = _lc & (_bench | _fill)
+            if int(_drop.sum()) > 0:
+                combined_picks = combined_picks[~_drop].reset_index(drop=True)
+    except Exception:
+        pass
+
     # v44.42 — DISTANCE BUG FIXED (traced across v44.28-41). The diagnostic
     # proved the data lands in combined_picks under `avg_hr_distance` (218/511
     # populated) but the `avg_dist` column comes out all-NaN because it was
@@ -14552,6 +14570,44 @@ if all_hitters:
     # duplicate columns at the source.
     if combined_all.columns.duplicated().any():
         combined_all = combined_all.loc[:, ~combined_all.columns.duplicated()]
+
+    # v46.55 (user-flagged: non-playing players in top-10 + everywhere else):
+    # When a game's lineup IS confirmed, players who are NOT in it (bench or
+    # roster-fill padding) must be excluded from EVERYTHING downstream — the
+    # snapshot, pattern analysis, backtesting, tier grading, and all displays —
+    # otherwise a confirmed scratch pollutes the data with an outcome it never
+    # earned. We filter HERE, at the single source that feeds the snapshot, so
+    # every consumer is protected at once.
+    #
+    # IMPORTANT (preserves early-day usefulness): we ONLY drop non-starters on
+    # games where the lineup is ACTUALLY confirmed. On games with no posted
+    # lineup yet, projected players are kept (that's the whole point of pre-lineup
+    # picks). So this hides confirmed scratches without blanking the early slate.
+    try:
+        if not combined_all.empty and "lineup_confirmed" in combined_all.columns:
+            _lc = combined_all["lineup_confirmed"].fillna(False).astype(bool)
+            _bench = (combined_all["is_bench"].fillna(False).astype(bool)
+                      if "is_bench" in combined_all.columns else False)
+            _fill = (combined_all["is_roster_fill"].fillna(False).astype(bool)
+                     if "is_roster_fill" in combined_all.columns else False)
+            _not_starter = _bench | _fill
+            # drop rows where the game is confirmed AND the player isn't a starter
+            _drop = _lc & _not_starter
+            _n_drop = int(_drop.sum())
+            if _n_drop > 0:
+                combined_all = combined_all[~_drop].reset_index(drop=True)
+                try:
+                    stash_diagnostic(
+                        "pipeline_health",
+                        f"Excluded {_n_drop} confirmed non-starter(s) "
+                        f"(bench/scratched) from the slate — they can't pollute "
+                        f"picks, patterns, or backtests.",
+                        level="caption",
+                    )
+                except Exception:
+                    pass
+    except Exception:
+        pass  # never let the filter crash the slate build
 
     # v46.19: apply the stranded convergence_count (computed on the q/picks copy)
     # onto combined_all by player_id so it reaches the snapshot and can be graded.
