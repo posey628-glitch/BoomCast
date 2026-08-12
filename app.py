@@ -208,17 +208,29 @@ def _get_manual_excludes() -> set:
         return set()
 
 
+def _norm_name(s):
+    """v46.59: normalize a name for matching — strip, lowercase, and remove
+    accents so 'José Ramírez' matches 'Jose Ramirez'. Baseball is full of
+    accented names; exact match alone silently fails on them."""
+    try:
+        import unicodedata
+        s = str(s).strip().lower()
+        return "".join(c for c in unicodedata.normalize("NFKD", s)
+                       if not unicodedata.combining(c))
+    except Exception:
+        return str(s).strip().lower()
+
+
 def _apply_manual_excludes(df):
     """Drop any row whose player_name is in the owner's manual exclude list.
     Safe: no name column or empty list → returns df unchanged. Never raises."""
     try:
-        excl = _get_manual_excludes()
+        excl = {_norm_name(n) for n in _get_manual_excludes()}
         if not excl or df is None or getattr(df, "empty", True):
             return df
         if "player_name" not in df.columns:
             return df
-        import pandas as _pd
-        _names = df["player_name"].fillna("").astype(str).str.strip().str.lower()
+        _names = df["player_name"].fillna("").astype(str).map(_norm_name)
         keep = ~_names.isin(excl)
         return df[keep]
     except Exception:
@@ -248,12 +260,12 @@ def _apply_list_hide(df, list_key: str):
     """Cosmetically hide names from ONE list's display only. Safe + isolated:
     operates on a per-list key, so it can't leak into other lists or the data."""
     try:
-        hides = _get_list_hides(list_key)
+        hides = {_norm_name(n) for n in _get_list_hides(list_key)}
         if not hides or df is None or getattr(df, "empty", True):
             return df
         if "player_name" not in df.columns:
             return df
-        _names = df["player_name"].fillna("").astype(str).str.strip().str.lower()
+        _names = df["player_name"].fillna("").astype(str).map(_norm_name)
         return df[~_names.isin(hides)]
     except Exception:
         return df
@@ -269,6 +281,57 @@ def _get_manual_adds() -> list:
         return list(st.session_state.get("_manual_add_players", []))
     except Exception:
         return []
+
+
+# ── DURABLE persistence for manual excludes (v46.60, user-requested: survive
+# page refresh). session_state is wiped on refresh, so the exclude list is ALSO
+# saved to the Gist, keyed by date — the SAME proven mechanism as owner picks.
+# On load we hydrate session_state from the Gist so refreshes keep your excludes.
+def _load_manual_excludes_gist(_date_iso) -> list:
+    """Read persisted manual excludes for a date from the Gist. Never raises."""
+    try:
+        from backtest import _gist_read_all
+        _all = _gist_read_all() or {}
+        return list((_all.get("_manual_excludes") or {}).get(_date_iso, []) or [])
+    except Exception:
+        return []
+
+
+def _save_manual_excludes_gist(_date_iso, _names) -> bool:
+    """Persist the manual exclude list for a date to the Gist. Keeps 14 days."""
+    try:
+        from backtest import _gist_read_all, _gist_write_all
+        _all = _gist_read_all() or {}
+        _me = dict(_all.get("_manual_excludes") or {})
+        _me[_date_iso] = sorted(set(str(n).strip() for n in _names if str(n).strip()))
+        for _old in sorted(_me.keys())[:-14]:
+            _me.pop(_old, None)
+        _all["_manual_excludes"] = _me
+        return bool(_gist_write_all(_all))
+    except Exception as _mee:
+        try:
+            log_swallowed_error("manual_excludes_save", _mee, surface=True)
+        except Exception:
+            pass
+        return False
+
+
+def _hydrate_manual_excludes(_date_iso):
+    """Once per session, load persisted excludes from the Gist into session_state
+    so a page refresh keeps them. Guarded so it runs only once per date."""
+    try:
+        import streamlit as st
+        _flag = f"_excl_hydrated_{_date_iso}"
+        if st.session_state.get(_flag):
+            return
+        _persisted = _load_manual_excludes_gist(_date_iso)
+        if _persisted:
+            _cur = set(st.session_state.get("_manual_exclude_names", set()))
+            _cur |= set(_persisted)
+            st.session_state["_manual_exclude_names"] = _cur
+        st.session_state[_flag] = True
+    except Exception:
+        pass
 
 
 # Core imports - make each one defensive so a single missing function
@@ -13083,45 +13146,56 @@ if combined_picks is not None and not combined_picks.empty:
         # players are removed from picks, the projected table, the snapshot, and
         # pattern analysis — and the Top-10 auto-fills the gap (next man up).
         if owner_mode:
+            # v46.60: hydrate persisted excludes from the Gist so they survive a
+            # page refresh (session_state alone is wiped on refresh).
+            try:
+                _hydrate_manual_excludes(selected_date.isoformat()
+                                         if hasattr(selected_date, "isoformat") else str(selected_date))
+            except Exception:
+                pass
             with st.expander("🚫 Manually exclude players (late injury/scratch news)", expanded=False):
                 st.caption(
                     "If you know a player is OUT before MLB's feed updates, exclude "
                     "them here. They're dropped from picks, the projected list, the "
                     "snapshot, and pattern analysis. The Top-10 fills the gap "
-                    "automatically (next man up). Resets each day."
+                    "automatically (next man up). Pick as many as you want — this "
+                    "saves and survives a page refresh. Resets daily."
                 )
-                _cur = sorted(st.session_state.get("_manual_exclude_names", set()))
-                # add a name
-                _add_col, _btn_col = st.columns([3, 1])
-                with _add_col:
-                    _new_name = st.text_input(
-                        "Player name to exclude (exact, as shown in picks)",
-                        key="_manual_excl_input", label_visibility="collapsed",
-                        placeholder="e.g. James Wood",
-                    )
-                with _btn_col:
-                    if st.button("Exclude", key="_manual_excl_add", use_container_width=True):
-                        if _new_name and _new_name.strip():
-                            _s = st.session_state.get("_manual_exclude_names", set())
-                            _s = set(_s); _s.add(_new_name.strip())
-                            st.session_state["_manual_exclude_names"] = _s
-                            st.rerun()
-                # show + clear current list
-                if _cur:
-                    st.markdown("**Currently excluded today:**")
-                    for _nm in _cur:
-                        _rc1, _rc2 = st.columns([4, 1])
-                        _rc1.write(f"🚫 {_nm}")
-                        if _rc2.button("Undo", key=f"_unexcl_{_nm}", use_container_width=True):
-                            _s = set(st.session_state.get("_manual_exclude_names", set()))
-                            _s.discard(_nm)
-                            st.session_state["_manual_exclude_names"] = _s
-                            st.rerun()
-                    if st.button("Clear all excludes", key="_manual_excl_clear"):
-                        st.session_state["_manual_exclude_names"] = set()
-                        st.rerun()
+                # v46.59: dropdown of ACTUAL slate names → guaranteed match.
+                _name_pool = []
+                try:
+                    if combined_picks is not None and "player_name" in combined_picks.columns:
+                        _name_pool = sorted(
+                            combined_picks["player_name"].dropna().astype(str).str.strip().unique().tolist()
+                        )
+                except Exception:
+                    _name_pool = []
+                _cur_excl = sorted(st.session_state.get("_manual_exclude_names", set()))
+                # include any already-excluded names not in the current pool (e.g.
+                # a player already filtered out) so they stay selectable/removable.
+                _options = sorted(set(_name_pool) | set(_cur_excl))
+                # v46.60: MULTISELECT — add/remove several at once. On change we
+                # persist to the Gist so it sticks across refreshes.
+                _selected = st.multiselect(
+                    "Excluded players (type to search; pick multiple)",
+                    options=_options,
+                    default=_cur_excl,
+                    key="_manual_excl_multi",
+                )
+                if set(_selected) != set(_cur_excl):
+                    st.session_state["_manual_exclude_names"] = set(_selected)
+                    # persist to gist (survives refresh)
+                    try:
+                        _di = (selected_date.isoformat()
+                               if hasattr(selected_date, "isoformat") else str(selected_date))
+                        _save_manual_excludes_gist(_di, _selected)
+                    except Exception:
+                        pass
+                    st.rerun()
+                if _selected:
+                    st.caption(f"🚫 Excluding {len(_selected)} player(s) — saved, survives refresh.")
                 else:
-                    st.caption("No manual excludes set today.")
+                    st.caption("No manual excludes set. Pick players above to exclude them.")
 
             # v46.58 (user-requested): TOOL B — cosmetic hide from THIS list only.
             # Distinct from the global exclude above: use this for a player who IS
@@ -13137,9 +13211,18 @@ if combined_picks is not None and not combined_picks.empty:
                 )
                 _hc1, _hc2 = st.columns([3, 1])
                 with _hc1:
-                    _hide_name = st.text_input(
-                        "Player to hide from Top-10", key="_top10_hide_input",
-                        label_visibility="collapsed", placeholder="e.g. a player you're fading",
+                    _hide_pool = []
+                    try:
+                        if top10 is not None and "player_name" in top10.columns:
+                            _hide_pool = sorted(
+                                top10["player_name"].dropna().astype(str).str.strip().unique().tolist()
+                            )
+                    except Exception:
+                        _hide_pool = []
+                    _hide_name = st.selectbox(
+                        "Player to hide from Top-10 (pick from the current list)",
+                        options=[""] + _hide_pool,
+                        key="_top10_hide_select", label_visibility="collapsed",
                     )
                 with _hc2:
                     if st.button("Hide", key="_top10_hide_add", use_container_width=True):
